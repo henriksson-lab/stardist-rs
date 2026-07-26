@@ -2,7 +2,7 @@
 
 This is a Rust translation of [StarDist](https://github.com/stardist/stardist) - Object Detection with Star-convex Shapes
 
-* 2026-07-26: Initial work
+* 2026-07-26: Initial translation
 
 Translated from upstream StarDist commit `e80c6de700693bc228ed3c9ba1dc19c3785667ee`.
 
@@ -70,7 +70,7 @@ information about how we approach translation.
 
 ## Usage
 
-This crate is intended primarily as a library. CLI-style prediction adapters are kept behind the optional `cli` feature.
+CLI-style prediction adapters are kept behind the optional `cli` feature.
 
 Enable the `burn` feature for the native Burn model implementation. The default feature set includes `hdf5`, which is needed for loading Keras `.h5` weights.
 
@@ -227,14 +227,14 @@ BSD 3-Clause License
 
 ## How to cite
 
-- Uwe Schmidt, Martin Weigert, Coleman Broaddus, and Gene Myers.  
-[*Cell Detection with Star-convex Polygons*](https://arxiv.org/abs/1806.03535).  
+- Uwe Schmidt, Martin Weigert, Coleman Broaddus, and Gene Myers.
+[*Cell Detection with Star-convex Polygons*](https://arxiv.org/abs/1806.03535).
 International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI), Granada, Spain, September 2018.
 
-- Martin Weigert, Uwe Schmidt, Robert Haase, Ko Sugawara, and Gene Myers.  
-[*Star-convex Polyhedra for 3D Object Detection and Segmentation in Microscopy*](http://openaccess.thecvf.com/content_WACV_2020/papers/Weigert_Star-convex_Polyhedra_for_3D_Object_Detection_and_Segmentation_in_Microscopy_WACV_2020_paper.pdf).  
+- Martin Weigert, Uwe Schmidt, Robert Haase, Ko Sugawara, and Gene Myers.
+[*Star-convex Polyhedra for 3D Object Detection and Segmentation in Microscopy*](http://openaccess.thecvf.com/content_WACV_2020/papers/Weigert_Star-convex_Polyhedra_for_3D_Object_Detection_and_Segmentation_in_Microscopy_WACV_2020_paper.pdf).
 The IEEE Winter Conference on Applications of Computer Vision (WACV), Snowmass Village, Colorado, March 2020.
 
-- Martin Weigert and Uwe Schmidt.  
-[*Nuclei Instance Segmentation and Classification in Histopathology Images with Stardist*](https://arxiv.org/abs/2203.02284).  
+- Martin Weigert and Uwe Schmidt.
+[*Nuclei Instance Segmentation and Classification in Histopathology Images with Stardist*](https://arxiv.org/abs/2203.02284).
 The IEEE International Symposium on Biomedical Imaging Challenges (ISBIC), Kolkata, India, March 2022.
