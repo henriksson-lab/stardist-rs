@@ -1,0 +1,5 @@
+/target/
+Cargo.lock
+stardist/build/
+stardist/**/*.so
+stardist/**/__pycache__/

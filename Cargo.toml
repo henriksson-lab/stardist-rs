@@ -1,0 +1,59 @@
+[package]
+name = "stardist-rs"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Rust translation of StarDist object detection with star-convex shapes"
+repository = "https://github.com/henriksson-lab/stardist-rs"
+readme = "README.md"
+include = [
+    "/Cargo.toml",
+    "/LICENSE.txt",
+    "/README.md",
+    "/src/**",
+    "/examples/**",
+    "/scripts/**",
+    "/assets/models/examples/2D_demo/config.json",
+    "/assets/models/examples/2D_demo/thresholds.json",
+    "/assets/models/examples/3D_demo/config.json",
+    "/assets/models/examples/3D_demo/thresholds.json",
+    "/assets/data/images/histo.jpg",
+    "/assets/data/images/img2d.tif",
+    "/assets/data/images/img3d.tif",
+    "/assets/data/images/mask2d.tif",
+    "/assets/data/images/mask3d.tif",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hdf5 = { version = "0.8", optional = true }
+ndarray = "0.16"
+ndarray-npy = "=0.9.1"
+geo-clipper = "0.9"
+geo-types = "0.7"
+zip = { version = "2.4.2", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+tiff = "0.11.3"
+
+[features]
+default = ["hdf5"]
+hdf5 = ["dep:hdf5"]
+burn = ["dep:burn"]
+candle = ["dep:candle-core", "dep:candle-nn"]
+cli = []
+
+[dependencies.burn]
+version = "0.21"
+default-features = false
+features = ["std", "train", "autodiff", "flex"]
+optional = true
+
+[dependencies.candle-core]
+version = "0.9"
+optional = true
+
+[dependencies.candle-nn]
+version = "0.9"
+optional = true
