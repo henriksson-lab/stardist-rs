@@ -32,5 +32,5 @@ fn load_thresholds(
     let prob = value.get("prob").and_then(Value::as_f64).map(|v| v as f32);
     let nms = value.get("nms").and_then(Value::as_f64).map(|v| v as f32);
 
-    Ok(StarDistThresholds::new(prob, nms))
+    Ok(StarDistThresholds::from_options(prob, nms)?)
 }

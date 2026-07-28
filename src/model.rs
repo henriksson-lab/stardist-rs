@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs::File, path::Path};
 
 use ndarray::{Array2, Array3};
+
+use serde::Deserialize;
 
 use crate::{ClassAssignment, Config2D, Config3D};
 
@@ -34,6 +36,24 @@ pub enum ThresholdsError {
     InvalidProb,
     #[error("nms threshold must be finite and between 0 and 1")]
     InvalidNms,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ThresholdsLoadError {
+    #[error("failed to read thresholds file")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse thresholds JSON")]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Thresholds(#[from] ThresholdsError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StarDistModelLoadError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Thresholds(#[from] ThresholdsLoadError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -396,16 +416,37 @@ impl Default for StarDistThresholds {
     }
 }
 
+#[derive(Deserialize)]
+struct ThresholdsJson {
+    prob: Option<f32>,
+    nms: Option<f32>,
+}
+
 impl StarDistThresholds {
-    pub fn new(prob: Option<f32>, nms: Option<f32>) -> Self {
-        Self {
-            prob: prob
-                .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
-                .unwrap_or(0.5),
-            nms: nms
-                .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
-                .unwrap_or(0.4),
+    pub fn new(prob: f32, nms: f32) -> Result<Self, ThresholdsError> {
+        let thresholds = Self { prob, nms };
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    pub fn from_options(prob: Option<f32>, nms: Option<f32>) -> Result<Self, ThresholdsError> {
+        Self::new(prob.unwrap_or(0.5), nms.unwrap_or(0.4))
+    }
+
+    pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, ThresholdsLoadError> {
+        let file = File::open(path)?;
+        let thresholds: ThresholdsJson = serde_json::from_reader(file)?;
+        Ok(Self::from_options(thresholds.prob, thresholds.nms)?)
+    }
+
+    fn validate(self) -> Result<(), ThresholdsError> {
+        if !self.prob.is_finite() || self.prob <= 0.0 || self.prob >= 1.0 {
+            return Err(ThresholdsError::InvalidProb);
         }
+        if !self.nms.is_finite() || self.nms <= 0.0 || self.nms >= 1.0 {
+            return Err(ThresholdsError::InvalidNms);
+        }
+        Ok(())
     }
 }
 
@@ -1844,7 +1885,7 @@ pub struct StarDist2DPredictInstancesResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StarDist3DInstances {
-    pub labels: Option<Array3<u32>>,
+    pub labels: Option<Array3<i32>>,
     pub dist: Vec<f32>,
     pub points: Vec<[f32; 3]>,
     pub prob: Vec<f32>,
@@ -1930,10 +1971,14 @@ pub enum StarDist3DPostprocessError {
     Geometry(#[from] crate::geometry::GeometryError),
     #[error(transparent)]
     Rays(#[from] crate::RaysError),
+    #[error(transparent)]
+    Matching(#[from] crate::MatchingError),
     #[error("prob_class must have one row per input candidate/pixel")]
     ClassProbShapeMismatch,
     #[error("scale must be non-zero for X, Y, and Z")]
     InvalidScale,
+    #[error("label image contains negative labels")]
+    NegativeLabel,
 }
 
 impl StarDist2D {
@@ -1944,17 +1989,19 @@ impl StarDist2D {
         }
     }
 
+    pub fn from_model_dir(path: impl AsRef<Path>) -> Result<Self, StarDistModelLoadError> {
+        let path = path.as_ref();
+        let config = Config2D::from_json_file(path.join("config.json"))?;
+        let thresholds = StarDistThresholds::from_json_file(path.join("thresholds.json"))?;
+        Ok(Self { config, thresholds })
+    }
+
     pub fn thresholds(&self) -> StarDistThresholds {
         self.thresholds
     }
 
     pub fn set_thresholds(&mut self, d: StarDistThresholds) -> Result<(), ThresholdsError> {
-        if !d.prob.is_finite() || d.prob <= 0.0 || d.prob >= 1.0 {
-            return Err(ThresholdsError::InvalidProb);
-        }
-        if !d.nms.is_finite() || d.nms <= 0.0 || d.nms >= 1.0 {
-            return Err(ThresholdsError::InvalidNms);
-        }
+        d.validate()?;
         self.thresholds = d;
         Ok(())
     }
@@ -2970,7 +3017,9 @@ impl StarDist2D {
                 callbacks.push(StarDistTrainCallback::TensorBoard);
             }
         }
-        callbacks.insert(0, StarDistTrainCallback::ReduceLrOnPlateau);
+        if self.config.train_reduce_lr.is_some() {
+            callbacks.insert(0, StarDistTrainCallback::ReduceLrOnPlateau);
+        }
         let checkpoint_callbacks = if basedir_is_some {
             self._checkpoint_callbacks(Some("."), false)
         } else {
@@ -3668,17 +3717,19 @@ impl StarDist3D {
         }
     }
 
+    pub fn from_model_dir(path: impl AsRef<Path>) -> Result<Self, StarDistModelLoadError> {
+        let path = path.as_ref();
+        let config = Config3D::from_json_file(path.join("config.json"))?;
+        let thresholds = StarDistThresholds::from_json_file(path.join("thresholds.json"))?;
+        Ok(Self { config, thresholds })
+    }
+
     pub fn thresholds(&self) -> StarDistThresholds {
         self.thresholds
     }
 
     pub fn set_thresholds(&mut self, d: StarDistThresholds) -> Result<(), ThresholdsError> {
-        if !d.prob.is_finite() || d.prob <= 0.0 || d.prob >= 1.0 {
-            return Err(ThresholdsError::InvalidProb);
-        }
-        if !d.nms.is_finite() || d.nms <= 0.0 || d.nms >= 1.0 {
-            return Err(ThresholdsError::InvalidNms);
-        }
+        d.validate()?;
         self.thresholds = d;
         Ok(())
     }
@@ -4933,7 +4984,9 @@ impl StarDist3D {
                 callbacks.push(StarDistTrainCallback::TensorBoard);
             }
         }
-        callbacks.insert(0, StarDistTrainCallback::ReduceLrOnPlateau);
+        if self.config.train_reduce_lr.is_some() {
+            callbacks.insert(0, StarDistTrainCallback::ReduceLrOnPlateau);
+        }
         let checkpoint_callbacks = if basedir_is_some {
             self._checkpoint_callbacks(Some("."), false)
         } else {
@@ -5084,7 +5137,7 @@ impl StarDist3D {
         prob_class: Option<(&[f32], usize)>,
         prob_thresh: Option<f32>,
         nms_thresh: Option<f32>,
-        overlap_label: Option<u32>,
+        overlap_label: Option<i32>,
         return_labels: bool,
         scale: Option<StarDist3DScale>,
         b: Option<[[usize; 2]; 3]>,
@@ -5178,7 +5231,7 @@ impl StarDist3D {
         }
 
         let labels = if return_labels {
-            Some(crate::geometry::polyhedron_to_label(
+            let raw_labels = crate::geometry::polyhedron_to_label(
                 &disti,
                 &pointsi,
                 &rays,
@@ -5188,7 +5241,36 @@ impl StarDist3D {
                 None,
                 render_mode,
                 overlap_label,
-            )?)
+            )?;
+            let labels = if overlap_label.is_some_and(|label| label < 0) {
+                let mut relabel_input = Vec::<u32>::with_capacity(raw_labels.len());
+                for label in raw_labels.iter() {
+                    relabel_input.push(if *label < 0 { 0 } else { *label as u32 });
+                }
+                let relabeled = crate::relabel_sequential(&relabel_input, 1)?;
+                let mut out = raw_labels.clone();
+                for (dst, label) in out.iter_mut().zip(relabeled.relabeled.iter()) {
+                    if *dst >= 0 {
+                        *dst = *label as i32;
+                    }
+                }
+                out
+            } else {
+                let mut relabel_input = Vec::<u32>::with_capacity(raw_labels.len());
+                for label in raw_labels.iter() {
+                    if *label < 0 {
+                        return Err(StarDist3DPostprocessError::NegativeLabel);
+                    }
+                    relabel_input.push(*label as u32);
+                }
+                let relabeled = crate::relabel_sequential(&relabel_input, 1)?;
+                let mut out = raw_labels.clone();
+                for (dst, label) in out.iter_mut().zip(relabeled.relabeled.iter()) {
+                    *dst = *label as i32;
+                }
+                out
+            };
+            Some(labels)
         } else {
             None
         };
@@ -5220,7 +5302,7 @@ impl StarDist3D {
         scale: Option<StarDist3DScale>,
         n_tiles: Option<&[usize]>,
         return_labels: bool,
-        overlap_label: Option<u32>,
+        overlap_label: Option<i32>,
         return_predict: bool,
         b: usize,
         use_bbox: bool,
@@ -5357,7 +5439,7 @@ impl StarDist3D {
         scale: Option<StarDist3DScale>,
         n_tiles: Option<&[usize]>,
         return_labels: bool,
-        overlap_label: Option<u32>,
+        overlap_label: Option<i32>,
         return_predict: bool,
         b: usize,
         use_bbox: bool,
@@ -5627,6 +5709,1615 @@ impl StarDist3D {
     }
 }
 
+#[cfg(feature = "candle")]
+pub mod candle {
+    use ::candle_core::{DType, Device, Error as CandleError, Result as CandleResult, Tensor};
+    use ::candle_nn::ops::{sigmoid, softmax};
+    use ::candle_nn::{Conv2d, Conv2dConfig, Conv3d, Conv3dConfig, Module};
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum CandleWeightError {
+        #[error("missing Keras weight tensor {0}")]
+        Missing(String),
+        #[error("wrong shape for {name}: expected {expected:?}, got {actual:?}")]
+        Shape {
+            name: String,
+            expected: Vec<usize>,
+            actual: Vec<usize>,
+        },
+        #[error(transparent)]
+        Tensor(#[from] CandleError),
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum CandleBuildError {
+        #[error("unsupported Candle backbone {0}")]
+        UnsupportedBackbone(String),
+        #[error("resnet_n_conv_per_block must be at least 2")]
+        InvalidResnetConvPerBlock,
+        #[error("grid must be reachable by repeated factor-2 pooling")]
+        UnsupportedGrid,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct CandleConv2d {
+        pub weight: Tensor,
+        pub bias: Option<Tensor>,
+        pub config: Conv2dConfig,
+    }
+
+    impl CandleConv2d {
+        fn zeros(
+            in_channels: usize,
+            out_channels: usize,
+            kernel: [usize; 2],
+            device: &Device,
+        ) -> CandleResult<Self> {
+            Ok(Self {
+                weight: Tensor::zeros(
+                    (out_channels, in_channels, kernel[0], kernel[1]),
+                    DType::F32,
+                    device,
+                )?,
+                bias: Some(Tensor::zeros((out_channels,), DType::F32, device)?),
+                config: Conv2dConfig {
+                    padding: kernel[0] / 2,
+                    ..Default::default()
+                },
+            })
+        }
+
+        pub fn forward(&self, input: &Tensor) -> CandleResult<Tensor> {
+            Conv2d::new(self.weight.clone(), self.bias.clone(), self.config).forward(input)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct CandleConv3dConfig {
+        pub padding: [usize; 3],
+        pub stride: [usize; 3],
+    }
+
+    impl Default for CandleConv3dConfig {
+        fn default() -> Self {
+            Self {
+                padding: [0, 0, 0],
+                stride: [1, 1, 1],
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct CandleConv3d {
+        pub weight: Tensor,
+        pub bias: Option<Tensor>,
+        pub config: CandleConv3dConfig,
+    }
+
+    impl CandleConv3d {
+        fn zeros(
+            in_channels: usize,
+            out_channels: usize,
+            kernel: [usize; 3],
+            config: CandleConv3dConfig,
+            device: &Device,
+        ) -> CandleResult<Self> {
+            Ok(Self {
+                weight: Tensor::zeros(
+                    (out_channels, in_channels, kernel[0], kernel[1], kernel[2]),
+                    DType::F32,
+                    device,
+                )?,
+                bias: Some(Tensor::zeros((out_channels,), DType::F32, device)?),
+                config,
+            })
+        }
+
+        pub fn forward(&self, input: &Tensor) -> CandleResult<Tensor> {
+            if self.config.padding[0] == self.config.padding[1]
+                && self.config.padding[1] == self.config.padding[2]
+                && self.config.stride[0] == self.config.stride[1]
+                && self.config.stride[1] == self.config.stride[2]
+            {
+                return Conv3d::new(
+                    self.weight.clone(),
+                    self.bias.clone(),
+                    Conv3dConfig {
+                        padding: self.config.padding[0],
+                        stride: self.config.stride[0],
+                        ..Default::default()
+                    },
+                )
+                .forward(input);
+            }
+
+            let (out_channels, _in_channels, kernel_d, _kernel_h, _kernel_w) =
+                self.weight.dims5()?;
+            let (batch, _input_channels, depth, height, width) = input.dims5()?;
+            let out_depth =
+                (depth + 2 * self.config.padding[0] - kernel_d) / self.config.stride[0] + 1;
+            let out_height = (height + 2 * self.config.padding[1] - self.weight.dim(3)?)
+                / self.config.stride[1]
+                + 1;
+            let out_width = (width + 2 * self.config.padding[2] - self.weight.dim(4)?)
+                / self.config.stride[2]
+                + 1;
+            let conv2d_config = Conv2dConfig {
+                padding: self.config.padding[1],
+                stride: self.config.stride[1],
+                ..Default::default()
+            };
+            let mut depth_outputs = Vec::with_capacity(out_depth);
+            for out_z in 0..out_depth {
+                let mut partial: Option<Tensor> = None;
+                for kernel_z in 0..kernel_d {
+                    let input_z = out_z * self.config.stride[0] + kernel_z;
+                    if input_z < self.config.padding[0] {
+                        continue;
+                    }
+                    let input_z = input_z - self.config.padding[0];
+                    if input_z >= depth {
+                        continue;
+                    }
+                    let input_slice = input.narrow(2, input_z, 1)?.squeeze(2)?;
+                    let weight_slice = self.weight.narrow(2, kernel_z, 1)?.squeeze(2)?;
+                    let next =
+                        Conv2d::new(weight_slice, None, conv2d_config).forward(&input_slice)?;
+                    partial = Some(match partial {
+                        Some(accumulated) => accumulated.broadcast_add(&next)?,
+                        None => next,
+                    });
+                }
+                let mut slice = partial.ok_or_else(|| {
+                    CandleError::Msg("empty 3D convolution depth window".to_string())
+                })?;
+                if let Some(bias) = &self.bias {
+                    slice = slice.broadcast_add(&bias.reshape((1, out_channels, 1, 1))?)?;
+                }
+                depth_outputs.push(slice.unsqueeze(2)?);
+            }
+            let output = Tensor::cat(&depth_outputs, 2)?;
+            output.reshape((batch, out_channels, out_depth, out_height, out_width))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Unet2DLevel {
+        pub convs: Vec<CandleConv2d>,
+        pub pool: [usize; 2],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Unet2DUpLevel {
+        pub convs: Vec<CandleConv2d>,
+        pub pool: [usize; 2],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Resnet3DBlock {
+        pub convs: Vec<CandleConv3d>,
+        pub shortcut: Option<CandleConv3d>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Unet3DLevel {
+        pub convs: Vec<CandleConv3d>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Unet3DUpLevel {
+        pub convs: Vec<CandleConv3d>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct StarDist2D {
+        pub config: crate::Config2D,
+        pub pre_pool_convs: Vec<CandleConv2d>,
+        pub pre_pool_pools: Vec<[usize; 2]>,
+        pub down_levels: Vec<Unet2DLevel>,
+        pub middle_convs: Vec<CandleConv2d>,
+        pub up_levels: Vec<Unet2DUpLevel>,
+        pub features: Option<CandleConv2d>,
+        pub prob: CandleConv2d,
+        pub dist: CandleConv2d,
+        pub features_class: Option<CandleConv2d>,
+        pub prob_class: Option<CandleConv2d>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct StarDist2DOutputs {
+        pub prob: Tensor,
+        pub dist: Tensor,
+        pub prob_class: Option<Tensor>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct StarDist3D {
+        pub config: crate::Config3D,
+        pub initial_7: Option<CandleConv3d>,
+        pub initial_3: Option<CandleConv3d>,
+        pub resnet_blocks: Vec<Resnet3DBlock>,
+        pub unet_pre_pool_convs: Vec<CandleConv3d>,
+        pub unet_pre_pool_pools: Vec<[usize; 3]>,
+        pub unet_down_levels: Vec<Unet3DLevel>,
+        pub unet_middle_convs: Vec<CandleConv3d>,
+        pub unet_up_levels: Vec<Unet3DUpLevel>,
+        pub features: Option<CandleConv3d>,
+        pub prob: CandleConv3d,
+        pub dist: CandleConv3d,
+        pub features_class: Option<CandleConv3d>,
+        pub prob_class: Option<CandleConv3d>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct StarDist3DOutputs {
+        pub prob: Tensor,
+        pub dist: Tensor,
+        pub prob_class: Option<Tensor>,
+    }
+
+    impl StarDist2D {
+        pub fn init(config: crate::Config2D, device: &Device) -> Self {
+            Self::try_init(config, device).expect("unsupported Candle StarDist2D config")
+        }
+
+        pub fn try_init(
+            config: crate::Config2D,
+            device: &Device,
+        ) -> Result<Self, CandleBuildError> {
+            if config.backbone != "unet" {
+                return Err(CandleBuildError::UnsupportedBackbone(
+                    config.backbone.clone(),
+                ));
+            }
+            let mut pooled = [1usize, 1];
+            let mut channels = config.n_channel_in;
+            let mut pre_pool_convs = Vec::new();
+            let mut pre_pool_pools = Vec::new();
+            while pooled != config.grid {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                ];
+                if pool == [1, 1]
+                    || config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                {
+                    return Err(CandleBuildError::UnsupportedGrid);
+                }
+                for _ in 0..config.unet_n_conv_per_depth {
+                    pre_pool_convs.push(
+                        CandleConv2d::zeros(
+                            channels,
+                            config.unet_n_filter_base,
+                            config.unet_kernel_size,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = config.unet_n_filter_base;
+                }
+                pre_pool_pools.push(pool);
+                pooled = [pooled[0] * pool[0], pooled[1] * pool[1]];
+            }
+
+            let mut down_levels = Vec::with_capacity(config.unet_n_depth);
+            let mut skip_channels = Vec::with_capacity(config.unet_n_depth);
+            for level in 0..config.unet_n_depth {
+                let out_channels = unet_channels(config.unet_n_filter_base, level);
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth {
+                    convs.push(
+                        CandleConv2d::zeros(
+                            channels,
+                            out_channels,
+                            config.unet_kernel_size,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = out_channels;
+                }
+                skip_channels.push(channels);
+                down_levels.push(Unet2DLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+
+            let mut middle_convs = Vec::with_capacity(config.unet_n_conv_per_depth.max(1));
+            for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                let out_channels = unet_channels(config.unet_n_filter_base, config.unet_n_depth);
+                middle_convs.push(
+                    CandleConv2d::zeros(channels, out_channels, config.unet_kernel_size, device)
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                channels = out_channels;
+            }
+            let middle_last_channels = unet_channels(
+                config.unet_n_filter_base,
+                config.unet_n_depth.saturating_sub(1),
+            );
+            middle_convs.push(
+                CandleConv2d::zeros(
+                    channels,
+                    middle_last_channels,
+                    config.unet_kernel_size,
+                    device,
+                )
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+            );
+            channels = middle_last_channels;
+
+            let mut up_levels = Vec::with_capacity(config.unet_n_depth);
+            for level in (0..config.unet_n_depth).rev() {
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                channels += skip_channels[level];
+                for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                    let out_channels = unet_channels(config.unet_n_filter_base, level);
+                    convs.push(
+                        CandleConv2d::zeros(
+                            channels,
+                            out_channels,
+                            config.unet_kernel_size,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = out_channels;
+                }
+                let out_channels =
+                    unet_channels(config.unet_n_filter_base, level.saturating_sub(1));
+                convs.push(
+                    CandleConv2d::zeros(channels, out_channels, config.unet_kernel_size, device)
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                channels = out_channels;
+                up_levels.push(Unet2DUpLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+
+            let features = if config.net_conv_after_unet > 0 {
+                let layer = CandleConv2d::zeros(
+                    channels,
+                    config.net_conv_after_unet,
+                    config.unet_kernel_size,
+                    device,
+                )
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+                channels = config.net_conv_after_unet;
+                Some(layer)
+            } else {
+                None
+            };
+            let prob = CandleConv2d::zeros(channels, 1, [1, 1], device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let dist = CandleConv2d::zeros(channels, config.n_rays, [1, 1], device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let class_head_channels = if config.net_conv_after_unet > 0 {
+                config.net_conv_after_unet
+            } else {
+                up_output_channels_2d(&config)
+            };
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_unet > 0 {
+                Some(
+                    CandleConv2d::zeros(
+                        up_output_channels_2d(&config),
+                        config.net_conv_after_unet,
+                        config.unet_kernel_size,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let prob_class = match config.n_classes {
+                Some(n_classes) => Some(
+                    CandleConv2d::zeros(class_head_channels, n_classes + 1, [1, 1], device)
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                ),
+                None => None,
+            };
+
+            Ok(Self {
+                config,
+                pre_pool_convs,
+                pre_pool_pools,
+                down_levels,
+                middle_convs,
+                up_levels,
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        pub fn forward(&self, input: &Tensor) -> CandleResult<StarDist2DOutputs> {
+            let mut layer = input.clone();
+            let mut conv_index = 0usize;
+            for pool in &self.pre_pool_pools {
+                for _ in 0..self.config.unet_n_conv_per_depth {
+                    layer = self.pre_pool_convs[conv_index].forward(&layer)?.relu()?;
+                    conv_index += 1;
+                }
+                layer = layer.max_pool2d((pool[0], pool[1]))?;
+            }
+
+            let mut skips = Vec::with_capacity(self.down_levels.len());
+            for level in &self.down_levels {
+                for conv in &level.convs {
+                    layer = conv.forward(&layer)?.relu()?;
+                }
+                skips.push(layer.clone());
+                layer = layer.max_pool2d((level.pool[0], level.pool[1]))?;
+            }
+            for conv in &self.middle_convs {
+                layer = conv.forward(&layer)?.relu()?;
+            }
+            for (up_level, skip) in self.up_levels.iter().zip(skips.into_iter().rev()) {
+                let (_batch, _channels, height, width) = layer.dims4()?;
+                layer = layer
+                    .upsample_nearest2d(height * up_level.pool[0], width * up_level.pool[1])?;
+                layer = Tensor::cat(&[&layer, &skip], 1)?;
+                for conv in &up_level.convs {
+                    layer = conv.forward(&layer)?.relu()?;
+                }
+            }
+
+            let unet_base = layer.clone();
+            let features = match &self.features {
+                Some(features) => features.forward(&layer)?.relu()?,
+                None => layer,
+            };
+            let prob = sigmoid(&self.prob.forward(&features)?)?;
+            let dist = self.dist.forward(&features)?;
+            let prob_class = match &self.prob_class {
+                Some(prob_class) => {
+                    let class_features = match &self.features_class {
+                        Some(features_class) => features_class.forward(&unet_base)?.relu()?,
+                        None => unet_base,
+                    };
+                    Some(softmax(&prob_class.forward(&class_features)?, 1)?)
+                }
+                None => None,
+            };
+            Ok(StarDist2DOutputs {
+                prob,
+                dist,
+                prob_class,
+            })
+        }
+
+        pub fn load_keras_weights(
+            mut self,
+            weights: &crate::KerasWeights,
+            device: &Device,
+        ) -> Result<Self, CandleWeightError> {
+            let mut channels = self.config.n_channel_in;
+            let mut auto_conv_index = 1usize;
+            for conv in &mut self.pre_pool_convs {
+                let out_channels = self.config.unet_n_filter_base;
+                let name = format!("conv2d_{auto_conv_index}/conv2d_{auto_conv_index}");
+                load_conv2d(
+                    conv,
+                    weights,
+                    &name,
+                    [
+                        out_channels,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = out_channels;
+                auto_conv_index += 1;
+            }
+            for (level_index, level) in self.down_levels.iter_mut().enumerate() {
+                let out_channels = unet_channels(self.config.unet_n_filter_base, level_index);
+                for (conv_index, conv) in level.convs.iter_mut().enumerate() {
+                    let name = format!(
+                        "down_level_{level_index}_no_{conv_index}/down_level_{level_index}_no_{conv_index}"
+                    );
+                    load_conv2d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+            }
+            let middle_len = self.middle_convs.len();
+            for (i, conv) in self.middle_convs.iter_mut().enumerate() {
+                let is_last = i + 1 == middle_len;
+                let name_index = if is_last {
+                    self.config.unet_n_conv_per_depth
+                } else {
+                    i
+                };
+                let out_channels = if is_last {
+                    unet_channels(
+                        self.config.unet_n_filter_base,
+                        self.config.unet_n_depth.saturating_sub(1),
+                    )
+                } else {
+                    unet_channels(self.config.unet_n_filter_base, self.config.unet_n_depth)
+                };
+                let name = format!("middle_{name_index}/middle_{name_index}");
+                load_conv2d(
+                    conv,
+                    weights,
+                    &name,
+                    [
+                        out_channels,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = out_channels;
+            }
+            for (up_position, up_level) in self.up_levels.iter_mut().enumerate() {
+                let level_index = self.config.unet_n_depth - 1 - up_position;
+                channels += unet_channels(self.config.unet_n_filter_base, level_index);
+                let up_len = up_level.convs.len();
+                for (conv_index, conv) in up_level.convs.iter_mut().enumerate() {
+                    let is_last = conv_index + 1 == up_len;
+                    let name_index = if is_last {
+                        self.config.unet_n_conv_per_depth
+                    } else {
+                        conv_index
+                    };
+                    let out_channels = if is_last {
+                        unet_channels(
+                            self.config.unet_n_filter_base,
+                            level_index.saturating_sub(1),
+                        )
+                    } else {
+                        unet_channels(self.config.unet_n_filter_base, level_index)
+                    };
+                    let name = format!(
+                        "up_level_{level_index}_no_{name_index}/up_level_{level_index}_no_{name_index}"
+                    );
+                    load_conv2d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+            }
+            let unet_base_channels = channels;
+            let head_channels = if let Some(features) = &mut self.features {
+                load_conv2d(
+                    features,
+                    weights,
+                    "features/features",
+                    [
+                        self.config.net_conv_after_unet,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = self.config.net_conv_after_unet;
+                channels
+            } else {
+                channels
+            };
+            load_conv2d(
+                &mut self.prob,
+                weights,
+                "prob/prob",
+                [1, head_channels, 1, 1],
+                device,
+            )?;
+            load_conv2d(
+                &mut self.dist,
+                weights,
+                "dist/dist",
+                [self.config.n_rays, head_channels, 1, 1],
+                device,
+            )?;
+            if let Some(features_class) = &mut self.features_class {
+                load_conv2d(
+                    features_class,
+                    weights,
+                    "features_class/features_class",
+                    [
+                        self.config.net_conv_after_unet,
+                        unet_base_channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+            }
+            if let Some(prob_class) = &mut self.prob_class {
+                let n_classes = self.config.n_classes.unwrap_or(0);
+                let class_head_channels = if self.config.net_conv_after_unet > 0 {
+                    self.config.net_conv_after_unet
+                } else {
+                    unet_base_channels
+                };
+                load_conv2d(
+                    prob_class,
+                    weights,
+                    "prob_class/prob_class",
+                    [n_classes + 1, class_head_channels, 1, 1],
+                    device,
+                )?;
+            }
+            Ok(self)
+        }
+    }
+
+    impl StarDist3D {
+        pub fn init(config: crate::Config3D, device: &Device) -> Self {
+            Self::try_init(config, device).expect("unsupported Candle StarDist3D config")
+        }
+
+        pub fn try_init(
+            config: crate::Config3D,
+            device: &Device,
+        ) -> Result<Self, CandleBuildError> {
+            if config.backbone == "unet" {
+                return Self::try_init_unet(config, device);
+            }
+            if config.backbone != "resnet" {
+                return Err(CandleBuildError::UnsupportedBackbone(
+                    config.backbone.clone(),
+                ));
+            }
+            if config.resnet_n_conv_per_block < 2 {
+                return Err(CandleBuildError::InvalidResnetConvPerBlock);
+            }
+            let same7 = CandleConv3dConfig {
+                padding: [3, 3, 3],
+                ..Default::default()
+            };
+            let same3 = CandleConv3dConfig {
+                padding: [1, 1, 1],
+                ..Default::default()
+            };
+            let valid = CandleConv3dConfig::default();
+            let mut channels = config.resnet_n_filter_base;
+            let initial_7 =
+                CandleConv3d::zeros(config.n_channel_in, channels, [7, 7, 7], same7, device)
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let initial_3 = CandleConv3d::zeros(channels, channels, [3, 3, 3], same3, device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let mut pooled = [1usize, 1, 1];
+            let mut resnet_blocks = Vec::with_capacity(config.resnet_n_blocks);
+            for _ in 0..config.resnet_n_blocks {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                    if config.grid[2] > pooled[2] { 2 } else { 1 },
+                ];
+                if pool == [1, 1, 1] && pooled != config.grid {
+                    return Err(CandleBuildError::UnsupportedGrid);
+                }
+                if config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                    || config.grid[2] % (pooled[2] * pool[2]) != 0
+                {
+                    return Err(CandleBuildError::UnsupportedGrid);
+                }
+                let out_channels = if pool.iter().any(|p| *p > 1) {
+                    channels * 2
+                } else {
+                    channels
+                };
+                let first_config = if pool.iter().any(|p| *p > 1) {
+                    CandleConv3dConfig {
+                        stride: pool,
+                        ..valid
+                    }
+                } else {
+                    same3
+                };
+                let mut convs = Vec::with_capacity(config.resnet_n_conv_per_block);
+                convs.push(
+                    CandleConv3d::zeros(
+                        channels,
+                        out_channels,
+                        config.resnet_kernel_size,
+                        first_config,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                for _ in 0..config.resnet_n_conv_per_block - 2 {
+                    convs.push(
+                        CandleConv3d::zeros(
+                            out_channels,
+                            out_channels,
+                            config.resnet_kernel_size,
+                            same3,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                }
+                convs.push(
+                    CandleConv3d::zeros(
+                        out_channels,
+                        out_channels,
+                        config.resnet_kernel_size,
+                        same3,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                let shortcut = if pool.iter().any(|p| *p > 1) || out_channels != channels {
+                    Some(
+                        CandleConv3d::zeros(
+                            channels,
+                            out_channels,
+                            [1, 1, 1],
+                            CandleConv3dConfig {
+                                stride: pool,
+                                ..valid
+                            },
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                resnet_blocks.push(Resnet3DBlock {
+                    convs,
+                    shortcut,
+                    pool,
+                });
+                channels = out_channels;
+                pooled = [
+                    pooled[0] * pool[0],
+                    pooled[1] * pool[1],
+                    pooled[2] * pool[2],
+                ];
+            }
+            let features = if config.net_conv_after_resnet > 0 {
+                Some(
+                    CandleConv3d::zeros(
+                        channels,
+                        config.net_conv_after_resnet,
+                        config.resnet_kernel_size,
+                        same3,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let head_channels = if config.net_conv_after_resnet > 0 {
+                config.net_conv_after_resnet
+            } else {
+                channels
+            };
+            let prob = CandleConv3d::zeros(head_channels, 1, [1, 1, 1], valid, device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let dist = CandleConv3d::zeros(head_channels, config.n_rays, [1, 1, 1], valid, device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_resnet > 0 {
+                Some(
+                    CandleConv3d::zeros(
+                        channels,
+                        config.net_conv_after_resnet,
+                        config.resnet_kernel_size,
+                        same3,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let prob_class = match config.n_classes {
+                Some(n_classes) => Some(
+                    CandleConv3d::zeros(head_channels, n_classes + 1, [1, 1, 1], valid, device)
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                ),
+                None => None,
+            };
+            Ok(Self {
+                config,
+                initial_7: Some(initial_7),
+                initial_3: Some(initial_3),
+                resnet_blocks,
+                unet_pre_pool_convs: Vec::new(),
+                unet_pre_pool_pools: Vec::new(),
+                unet_down_levels: Vec::new(),
+                unet_middle_convs: Vec::new(),
+                unet_up_levels: Vec::new(),
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        fn try_init_unet(
+            config: crate::Config3D,
+            device: &Device,
+        ) -> Result<Self, CandleBuildError> {
+            let same = CandleConv3dConfig {
+                padding: [
+                    config.unet_kernel_size[0] / 2,
+                    config.unet_kernel_size[1] / 2,
+                    config.unet_kernel_size[2] / 2,
+                ],
+                ..Default::default()
+            };
+            let valid = CandleConv3dConfig::default();
+            let mut pooled = [1usize, 1, 1];
+            let mut channels = config.n_channel_in;
+            let mut unet_pre_pool_convs = Vec::new();
+            let mut unet_pre_pool_pools = Vec::new();
+            while pooled != config.grid {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                    if config.grid[2] > pooled[2] { 2 } else { 1 },
+                ];
+                if pool == [1, 1, 1]
+                    || config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                    || config.grid[2] % (pooled[2] * pool[2]) != 0
+                {
+                    return Err(CandleBuildError::UnsupportedGrid);
+                }
+                for _ in 0..config.unet_n_conv_per_depth {
+                    unet_pre_pool_convs.push(
+                        CandleConv3d::zeros(
+                            channels,
+                            config.unet_n_filter_base,
+                            config.unet_kernel_size,
+                            same,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = config.unet_n_filter_base;
+                }
+                unet_pre_pool_pools.push(pool);
+                pooled = [
+                    pooled[0] * pool[0],
+                    pooled[1] * pool[1],
+                    pooled[2] * pool[2],
+                ];
+            }
+            let mut unet_down_levels = Vec::with_capacity(config.unet_n_depth);
+            let mut skip_channels = Vec::with_capacity(config.unet_n_depth);
+            for level in 0..config.unet_n_depth {
+                let out_channels = unet_channels(config.unet_n_filter_base, level);
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth {
+                    convs.push(
+                        CandleConv3d::zeros(
+                            channels,
+                            out_channels,
+                            config.unet_kernel_size,
+                            same,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = out_channels;
+                }
+                skip_channels.push(channels);
+                unet_down_levels.push(Unet3DLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+            let mut unet_middle_convs = Vec::with_capacity(config.unet_n_conv_per_depth.max(1));
+            for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                let out_channels = unet_channels(config.unet_n_filter_base, config.unet_n_depth);
+                unet_middle_convs.push(
+                    CandleConv3d::zeros(
+                        channels,
+                        out_channels,
+                        config.unet_kernel_size,
+                        same,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                channels = out_channels;
+            }
+            let middle_last_channels = unet_channels(
+                config.unet_n_filter_base,
+                config.unet_n_depth.saturating_sub(1),
+            );
+            unet_middle_convs.push(
+                CandleConv3d::zeros(
+                    channels,
+                    middle_last_channels,
+                    config.unet_kernel_size,
+                    same,
+                    device,
+                )
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+            );
+            channels = middle_last_channels;
+            let mut unet_up_levels = Vec::with_capacity(config.unet_n_depth);
+            for level in (0..config.unet_n_depth).rev() {
+                channels += skip_channels[level];
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                    let out_channels = unet_channels(config.unet_n_filter_base, level);
+                    convs.push(
+                        CandleConv3d::zeros(
+                            channels,
+                            out_channels,
+                            config.unet_kernel_size,
+                            same,
+                            device,
+                        )
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                    );
+                    channels = out_channels;
+                }
+                let out_channels =
+                    unet_channels(config.unet_n_filter_base, level.saturating_sub(1));
+                convs.push(
+                    CandleConv3d::zeros(
+                        channels,
+                        out_channels,
+                        config.unet_kernel_size,
+                        same,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                );
+                channels = out_channels;
+                unet_up_levels.push(Unet3DUpLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+            let unet_base_channels = channels;
+            let features = if config.net_conv_after_unet > 0 {
+                Some(
+                    CandleConv3d::zeros(
+                        channels,
+                        config.net_conv_after_unet,
+                        config.unet_kernel_size,
+                        same,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let head_channels = if config.net_conv_after_unet > 0 {
+                config.net_conv_after_unet
+            } else {
+                channels
+            };
+            let prob = CandleConv3d::zeros(head_channels, 1, [1, 1, 1], valid, device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let dist = CandleConv3d::zeros(head_channels, config.n_rays, [1, 1, 1], valid, device)
+                .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?;
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_unet > 0 {
+                Some(
+                    CandleConv3d::zeros(
+                        unet_base_channels,
+                        config.net_conv_after_unet,
+                        config.unet_kernel_size,
+                        same,
+                        device,
+                    )
+                    .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let prob_class = match config.n_classes {
+                Some(n_classes) => Some(
+                    CandleConv3d::zeros(head_channels, n_classes + 1, [1, 1, 1], valid, device)
+                        .map_err(|err| CandleBuildError::UnsupportedBackbone(err.to_string()))?,
+                ),
+                None => None,
+            };
+            Ok(Self {
+                config,
+                initial_7: None,
+                initial_3: None,
+                resnet_blocks: Vec::new(),
+                unet_pre_pool_convs,
+                unet_pre_pool_pools,
+                unet_down_levels,
+                unet_middle_convs,
+                unet_up_levels,
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        pub fn forward(&self, input: &Tensor) -> CandleResult<StarDist3DOutputs> {
+            let layer_base = if self.config.backbone == "unet" {
+                let mut layer = input.clone();
+                let mut conv_index = 0usize;
+                for pool in &self.unet_pre_pool_pools {
+                    for _ in 0..self.config.unet_n_conv_per_depth {
+                        layer = self.unet_pre_pool_convs[conv_index]
+                            .forward(&layer)?
+                            .relu()?;
+                        conv_index += 1;
+                    }
+                    layer = max_pool3d_valid(&layer, *pool)?;
+                }
+                let mut skips = Vec::with_capacity(self.unet_down_levels.len());
+                for level in &self.unet_down_levels {
+                    for conv in &level.convs {
+                        layer = conv.forward(&layer)?.relu()?;
+                    }
+                    skips.push(layer.clone());
+                    layer = max_pool3d_valid(&layer, level.pool)?;
+                }
+                for conv in &self.unet_middle_convs {
+                    layer = conv.forward(&layer)?.relu()?;
+                }
+                for (up_level, skip) in self.unet_up_levels.iter().zip(skips.into_iter().rev()) {
+                    layer = upsample3d_nearest(&layer, up_level.pool)?;
+                    layer = Tensor::cat(&[&layer, &skip], 1)?;
+                    for conv in &up_level.convs {
+                        layer = conv.forward(&layer)?.relu()?;
+                    }
+                }
+                layer
+            } else {
+                let mut layer = self
+                    .initial_7
+                    .as_ref()
+                    .expect("missing 3D resnet initial_7")
+                    .forward(input)?;
+                layer = self
+                    .initial_3
+                    .as_ref()
+                    .expect("missing 3D resnet initial_3")
+                    .forward(&layer)?;
+                for block in &self.resnet_blocks {
+                    let shortcut = match &block.shortcut {
+                        Some(shortcut) => shortcut.forward(&layer)?,
+                        None => layer.clone(),
+                    };
+                    let mut residual = if block.pool.iter().any(|p| *p > 1) {
+                        conv3d_same_for_stride(&layer, block.pool, self.config.resnet_kernel_size)?
+                    } else {
+                        layer
+                    };
+                    for (i, conv) in block.convs.iter().enumerate() {
+                        residual = conv.forward(&residual)?;
+                        if i + 1 != block.convs.len() {
+                            residual = residual.relu()?;
+                        }
+                    }
+                    layer = residual.broadcast_add(&shortcut)?.relu()?;
+                }
+                layer
+            };
+            let features = match &self.features {
+                Some(features) => features.forward(&layer_base)?.relu()?,
+                None => layer_base.clone(),
+            };
+            let prob = sigmoid(&self.prob.forward(&features)?)?;
+            let dist = self.dist.forward(&features)?;
+            let prob_class = match &self.prob_class {
+                Some(prob_class) => {
+                    let class_features = match &self.features_class {
+                        Some(features_class) => features_class.forward(&layer_base)?.relu()?,
+                        None => layer_base,
+                    };
+                    Some(softmax(&prob_class.forward(&class_features)?, 1)?)
+                }
+                None => None,
+            };
+            Ok(StarDist3DOutputs {
+                prob,
+                dist,
+                prob_class,
+            })
+        }
+
+        pub fn load_keras_weights(
+            mut self,
+            weights: &crate::KerasWeights,
+            device: &Device,
+        ) -> Result<Self, CandleWeightError> {
+            if self.config.backbone == "unet" {
+                let mut channels = self.config.n_channel_in;
+                let mut auto_conv_index = 1usize;
+                for conv in &mut self.unet_pre_pool_convs {
+                    let out_channels = self.config.unet_n_filter_base;
+                    let name = format!("conv3d_{auto_conv_index}/conv3d_{auto_conv_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                    auto_conv_index += 1;
+                }
+                for (level_index, level) in self.unet_down_levels.iter_mut().enumerate() {
+                    let out_channels = unet_channels(self.config.unet_n_filter_base, level_index);
+                    for (conv_index, conv) in level.convs.iter_mut().enumerate() {
+                        let name = format!(
+                            "down_level_{level_index}_no_{conv_index}/down_level_{level_index}_no_{conv_index}"
+                        );
+                        load_conv3d(
+                            conv,
+                            weights,
+                            &name,
+                            [
+                                out_channels,
+                                channels,
+                                self.config.unet_kernel_size[0],
+                                self.config.unet_kernel_size[1],
+                                self.config.unet_kernel_size[2],
+                            ],
+                            device,
+                        )?;
+                        channels = out_channels;
+                    }
+                }
+                let middle_len = self.unet_middle_convs.len();
+                for (i, conv) in self.unet_middle_convs.iter_mut().enumerate() {
+                    let is_last = i + 1 == middle_len;
+                    let name_index = if is_last {
+                        self.config.unet_n_conv_per_depth
+                    } else {
+                        i
+                    };
+                    let out_channels = if is_last {
+                        unet_channels(
+                            self.config.unet_n_filter_base,
+                            self.config.unet_n_depth.saturating_sub(1),
+                        )
+                    } else {
+                        unet_channels(self.config.unet_n_filter_base, self.config.unet_n_depth)
+                    };
+                    let name = format!("middle_{name_index}/middle_{name_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+                for (up_position, up_level) in self.unet_up_levels.iter_mut().enumerate() {
+                    let level_index = self.config.unet_n_depth - 1 - up_position;
+                    channels += unet_channels(self.config.unet_n_filter_base, level_index);
+                    let up_len = up_level.convs.len();
+                    for (conv_index, conv) in up_level.convs.iter_mut().enumerate() {
+                        let is_last = conv_index + 1 == up_len;
+                        let name_index = if is_last {
+                            self.config.unet_n_conv_per_depth
+                        } else {
+                            conv_index
+                        };
+                        let out_channels = if is_last {
+                            unet_channels(
+                                self.config.unet_n_filter_base,
+                                level_index.saturating_sub(1),
+                            )
+                        } else {
+                            unet_channels(self.config.unet_n_filter_base, level_index)
+                        };
+                        let name = format!(
+                            "up_level_{level_index}_no_{name_index}/up_level_{level_index}_no_{name_index}"
+                        );
+                        load_conv3d(
+                            conv,
+                            weights,
+                            &name,
+                            [
+                                out_channels,
+                                channels,
+                                self.config.unet_kernel_size[0],
+                                self.config.unet_kernel_size[1],
+                                self.config.unet_kernel_size[2],
+                            ],
+                            device,
+                        )?;
+                        channels = out_channels;
+                    }
+                }
+                let unet_base_channels = channels;
+                let head_channels = if let Some(features) = &mut self.features {
+                    load_conv3d(
+                        features,
+                        weights,
+                        "features/features",
+                        [
+                            self.config.net_conv_after_unet,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    self.config.net_conv_after_unet
+                } else {
+                    unet_base_channels
+                };
+                load_conv3d(
+                    &mut self.prob,
+                    weights,
+                    "prob/prob",
+                    [1, head_channels, 1, 1, 1],
+                    device,
+                )?;
+                load_conv3d(
+                    &mut self.dist,
+                    weights,
+                    "dist/dist",
+                    [self.config.n_rays, head_channels, 1, 1, 1],
+                    device,
+                )?;
+                if let Some(features_class) = &mut self.features_class {
+                    load_conv3d(
+                        features_class,
+                        weights,
+                        "features_class/features_class",
+                        [
+                            self.config.net_conv_after_unet,
+                            unet_base_channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                }
+                if let Some(prob_class) = &mut self.prob_class {
+                    let n_classes = self.config.n_classes.unwrap_or(0);
+                    let class_head_channels = if self.config.net_conv_after_unet > 0 {
+                        self.config.net_conv_after_unet
+                    } else {
+                        unet_base_channels
+                    };
+                    load_conv3d(
+                        prob_class,
+                        weights,
+                        "prob_class/prob_class",
+                        [n_classes + 1, class_head_channels, 1, 1, 1],
+                        device,
+                    )?;
+                }
+                return Ok(self);
+            }
+
+            let mut channels = self.config.resnet_n_filter_base;
+            let mut conv_index = 1usize;
+            load_conv3d(
+                self.initial_7
+                    .as_mut()
+                    .expect("missing 3D resnet initial_7"),
+                weights,
+                "conv3d_1/conv3d_1",
+                [channels, self.config.n_channel_in, 7, 7, 7],
+                device,
+            )?;
+            conv_index += 1;
+            load_conv3d(
+                self.initial_3
+                    .as_mut()
+                    .expect("missing 3D resnet initial_3"),
+                weights,
+                "conv3d_2/conv3d_2",
+                [channels, channels, 3, 3, 3],
+                device,
+            )?;
+            conv_index += 1;
+            for block in &mut self.resnet_blocks {
+                let out_channels = block.convs[0].weight.dim(0)?;
+                for conv in &mut block.convs {
+                    let name = format!("conv3d_{conv_index}/conv3d_{conv_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.resnet_kernel_size[0],
+                            self.config.resnet_kernel_size[1],
+                            self.config.resnet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                    conv_index += 1;
+                }
+                if let Some(shortcut) = &mut block.shortcut {
+                    let name = format!("conv3d_{conv_index}/conv3d_{conv_index}");
+                    let in_channels = shortcut.weight.dim(1)?;
+                    load_conv3d(
+                        shortcut,
+                        weights,
+                        &name,
+                        [out_channels, in_channels, 1, 1, 1],
+                        device,
+                    )?;
+                    conv_index += 1;
+                }
+            }
+            let layer_base_channels = channels;
+            let head_channels = if let Some(features) = &mut self.features {
+                load_conv3d(
+                    features,
+                    weights,
+                    "features/features",
+                    [
+                        self.config.net_conv_after_resnet,
+                        layer_base_channels,
+                        self.config.resnet_kernel_size[0],
+                        self.config.resnet_kernel_size[1],
+                        self.config.resnet_kernel_size[2],
+                    ],
+                    device,
+                )?;
+                self.config.net_conv_after_resnet
+            } else {
+                layer_base_channels
+            };
+            load_conv3d(
+                &mut self.prob,
+                weights,
+                "prob/prob",
+                [1, head_channels, 1, 1, 1],
+                device,
+            )?;
+            load_conv3d(
+                &mut self.dist,
+                weights,
+                "dist/dist",
+                [self.config.n_rays, head_channels, 1, 1, 1],
+                device,
+            )?;
+            if let Some(features_class) = &mut self.features_class {
+                load_conv3d(
+                    features_class,
+                    weights,
+                    "features_class/features_class",
+                    [
+                        self.config.net_conv_after_resnet,
+                        layer_base_channels,
+                        self.config.resnet_kernel_size[0],
+                        self.config.resnet_kernel_size[1],
+                        self.config.resnet_kernel_size[2],
+                    ],
+                    device,
+                )?;
+            }
+            if let Some(prob_class) = &mut self.prob_class {
+                let n_classes = self.config.n_classes.unwrap_or(0);
+                let class_head_channels = if self.config.net_conv_after_resnet > 0 {
+                    self.config.net_conv_after_resnet
+                } else {
+                    layer_base_channels
+                };
+                load_conv3d(
+                    prob_class,
+                    weights,
+                    "prob_class/prob_class",
+                    [n_classes + 1, class_head_channels, 1, 1, 1],
+                    device,
+                )?;
+            }
+            Ok(self)
+        }
+    }
+
+    fn unet_channels(base: usize, level: usize) -> usize {
+        base * (1usize << level)
+    }
+
+    fn up_output_channels_2d(config: &crate::Config2D) -> usize {
+        unet_channels(config.unet_n_filter_base, 0)
+    }
+
+    fn conv3d_same_for_stride(
+        layer: &Tensor,
+        stride: [usize; 3],
+        kernel: [usize; 3],
+    ) -> CandleResult<Tensor> {
+        if stride == [1, 1, 1] {
+            return Ok(layer.clone());
+        }
+        let (_batch, _channels, depth, height, width) = layer.dims5()?;
+        let out_depth = depth.div_ceil(stride[0]);
+        let out_height = height.div_ceil(stride[1]);
+        let out_width = width.div_ceil(stride[2]);
+        let pad_depth = ((out_depth - 1) * stride[0] + kernel[0]).saturating_sub(depth);
+        let pad_height = ((out_height - 1) * stride[1] + kernel[1]).saturating_sub(height);
+        let pad_width = ((out_width - 1) * stride[2] + kernel[2]).saturating_sub(width);
+        layer
+            .pad_with_zeros(2, pad_depth / 2, pad_depth - pad_depth / 2)?
+            .pad_with_zeros(3, pad_height / 2, pad_height - pad_height / 2)?
+            .pad_with_zeros(4, pad_width / 2, pad_width - pad_width / 2)
+    }
+
+    fn max_pool3d_valid(layer: &Tensor, pool: [usize; 3]) -> CandleResult<Tensor> {
+        if pool == [1, 1, 1] {
+            return Ok(layer.clone());
+        }
+        let (batch, channels, depth, height, width) = layer.dims5()?;
+        let out_depth = depth / pool[0];
+        let out_height = height / pool[1];
+        let out_width = width / pool[2];
+        layer
+            .reshape(&[
+                batch, channels, out_depth, pool[0], out_height, pool[1], out_width, pool[2],
+            ])?
+            .max(7)?
+            .max(5)?
+            .max(3)?
+            .reshape((batch, channels, out_depth, out_height, out_width))
+    }
+
+    fn upsample3d_nearest(layer: &Tensor, scale: [usize; 3]) -> CandleResult<Tensor> {
+        layer
+            .repeat((1, 1, scale[0], scale[1], scale[2]))?
+            .reshape((
+                layer.dim(0)?,
+                layer.dim(1)?,
+                layer.dim(2)? * scale[0],
+                layer.dim(3)? * scale[1],
+                layer.dim(4)? * scale[2],
+            ))
+    }
+
+    fn load_conv2d(
+        layer: &mut CandleConv2d,
+        weights: &crate::KerasWeights,
+        prefix: &str,
+        expected_kernel_shape: [usize; 4],
+        device: &Device,
+    ) -> Result<(), CandleWeightError> {
+        let kernel_name = format!("{prefix}/kernel:0");
+        let kernel = weights
+            .get(&kernel_name)
+            .ok_or_else(|| CandleWeightError::Missing(kernel_name.clone()))?;
+        if kernel.shape != expected_kernel_shape {
+            return Err(CandleWeightError::Shape {
+                name: kernel_name,
+                expected: expected_kernel_shape.to_vec(),
+                actual: kernel.shape.clone(),
+            });
+        }
+        layer.weight = Tensor::from_vec(
+            kernel.values.clone(),
+            (
+                expected_kernel_shape[0],
+                expected_kernel_shape[1],
+                expected_kernel_shape[2],
+                expected_kernel_shape[3],
+            ),
+            device,
+        )?;
+
+        let bias_name = format!("{prefix}/bias:0");
+        let bias = weights
+            .get(&bias_name)
+            .ok_or_else(|| CandleWeightError::Missing(bias_name.clone()))?;
+        if bias.shape != vec![expected_kernel_shape[0]] {
+            return Err(CandleWeightError::Shape {
+                name: bias_name,
+                expected: vec![expected_kernel_shape[0]],
+                actual: bias.shape.clone(),
+            });
+        }
+        layer.bias = Some(Tensor::from_vec(
+            bias.values.clone(),
+            (expected_kernel_shape[0],),
+            device,
+        )?);
+        Ok(())
+    }
+
+    fn load_conv3d(
+        layer: &mut CandleConv3d,
+        weights: &crate::KerasWeights,
+        prefix: &str,
+        expected_kernel_shape: [usize; 5],
+        device: &Device,
+    ) -> Result<(), CandleWeightError> {
+        let kernel_name = format!("{prefix}/kernel:0");
+        let kernel = weights
+            .get(&kernel_name)
+            .ok_or_else(|| CandleWeightError::Missing(kernel_name.clone()))?;
+        if kernel.shape != expected_kernel_shape {
+            return Err(CandleWeightError::Shape {
+                name: kernel_name,
+                expected: expected_kernel_shape.to_vec(),
+                actual: kernel.shape.clone(),
+            });
+        }
+        layer.weight = Tensor::from_vec(
+            kernel.values.clone(),
+            (
+                expected_kernel_shape[0],
+                expected_kernel_shape[1],
+                expected_kernel_shape[2],
+                expected_kernel_shape[3],
+                expected_kernel_shape[4],
+            ),
+            device,
+        )?;
+
+        let bias_name = format!("{prefix}/bias:0");
+        let bias = weights
+            .get(&bias_name)
+            .ok_or_else(|| CandleWeightError::Missing(bias_name.clone()))?;
+        if bias.shape != vec![expected_kernel_shape[0]] {
+            return Err(CandleWeightError::Shape {
+                name: bias_name,
+                expected: vec![expected_kernel_shape[0]],
+                actual: bias.shape.clone(),
+            });
+        }
+        layer.bias = Some(Tensor::from_vec(
+            bias.values.clone(),
+            (expected_kernel_shape[0],),
+            device,
+        )?);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "burn")]
 pub mod burn {
     use ::burn::module::{AutodiffModule, Module, Param};
@@ -5654,6 +7345,20 @@ pub mod burn {
             expected: Vec<usize>,
             actual: Vec<usize>,
         },
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum BurnBuildError {
+        #[error("unsupported Burn backbone {0}")]
+        UnsupportedBackbone(String),
+        #[error("resnet_n_conv_per_block must be at least 2")]
+        InvalidResnetConvPerBlock,
+        #[error("grid must be reachable by repeated factor-2 pooling")]
+        UnsupportedGrid,
+        #[error("net_conv_after_unet must be positive for Burn StarDist2D")]
+        Missing2DFeatureLayer,
+        #[error("net_conv_after_resnet must be positive for Burn StarDist3D resnet")]
+        Missing3DFeatureLayer,
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -5685,32 +7390,45 @@ pub mod burn {
     }
 
     #[derive(Module, Debug)]
+    pub struct Unet2DLevel<B: Backend> {
+        pub convs: Vec<Conv2d<B>>,
+        pub pool: MaxPool2d,
+    }
+
+    #[derive(Module, Debug)]
+    pub struct Unet2DUpLevel<B: Backend> {
+        pub upsample: Interpolate2d,
+        pub convs: Vec<Conv2d<B>>,
+    }
+
+    #[derive(Module, Debug)]
+    pub struct Resnet3DBlock<B: Backend> {
+        pub convs: Vec<Conv3d<B>>,
+        pub shortcut: Option<Conv3d<B>>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Module, Debug)]
+    pub struct Unet3DLevel<B: Backend> {
+        pub convs: Vec<Conv3d<B>>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Module, Debug)]
+    pub struct Unet3DUpLevel<B: Backend> {
+        pub convs: Vec<Conv3d<B>>,
+        pub pool: [usize; 3],
+    }
+
+    #[derive(Module, Debug)]
     pub struct StarDist2D<B: Backend> {
         pub config: crate::Config2D,
-        pub conv2d_1: Conv2d<B>,
-        pub conv2d_2: Conv2d<B>,
-        pub max_pooling2d_1: MaxPool2d,
-        pub down_level_0_no_0: Conv2d<B>,
-        pub down_level_0_no_1: Conv2d<B>,
-        pub max_0: MaxPool2d,
-        pub down_level_1_no_0: Conv2d<B>,
-        pub down_level_1_no_1: Conv2d<B>,
-        pub max_1: MaxPool2d,
-        pub down_level_2_no_0: Conv2d<B>,
-        pub down_level_2_no_1: Conv2d<B>,
-        pub max_2: MaxPool2d,
-        pub middle_0: Conv2d<B>,
-        pub middle_2: Conv2d<B>,
-        pub up_sampling2d_1: Interpolate2d,
-        pub up_level_2_no_0: Conv2d<B>,
-        pub up_level_2_no_2: Conv2d<B>,
-        pub up_sampling2d_2: Interpolate2d,
-        pub up_level_1_no_0: Conv2d<B>,
-        pub up_level_1_no_2: Conv2d<B>,
-        pub up_sampling2d_3: Interpolate2d,
-        pub up_level_0_no_0: Conv2d<B>,
-        pub up_level_0_no_2: Conv2d<B>,
-        pub features: Conv2d<B>,
+        pub pre_pool_convs: Vec<Conv2d<B>>,
+        pub pre_pool_pools: Vec<MaxPool2d>,
+        pub down_levels: Vec<Unet2DLevel<B>>,
+        pub middle_convs: Vec<Conv2d<B>>,
+        pub up_levels: Vec<Unet2DUpLevel<B>>,
+        pub features: Option<Conv2d<B>>,
         pub prob: Conv2d<B>,
         pub dist: Conv2d<B>,
         pub features_class: Option<Conv2d<B>>,
@@ -5727,22 +7445,15 @@ pub mod burn {
     #[derive(Module, Debug)]
     pub struct StarDist3D<B: Backend> {
         pub config: crate::config::Config3D,
-        pub conv3d_1: Conv3d<B>,
-        pub conv3d_2: Conv3d<B>,
-        pub conv3d_3: Conv3d<B>,
-        pub conv3d_4: Conv3d<B>,
-        pub conv3d_5: Conv3d<B>,
-        pub conv3d_6: Conv3d<B>,
-        pub conv3d_7: Conv3d<B>,
-        pub conv3d_8: Conv3d<B>,
-        pub conv3d_9: Conv3d<B>,
-        pub conv3d_10: Conv3d<B>,
-        pub conv3d_11: Conv3d<B>,
-        pub conv3d_12: Conv3d<B>,
-        pub conv3d_13: Conv3d<B>,
-        pub conv3d_14: Conv3d<B>,
-        pub conv3d_15: Conv3d<B>,
-        pub features: Conv3d<B>,
+        pub initial_7: Option<Conv3d<B>>,
+        pub initial_3: Option<Conv3d<B>>,
+        pub resnet_blocks: Vec<Resnet3DBlock<B>>,
+        pub unet_pre_pool_convs: Vec<Conv3d<B>>,
+        pub unet_pre_pool_pools: Vec<[usize; 3]>,
+        pub unet_down_levels: Vec<Unet3DLevel<B>>,
+        pub unet_middle_convs: Vec<Conv3d<B>>,
+        pub unet_up_levels: Vec<Unet3DUpLevel<B>>,
+        pub features: Option<Conv3d<B>>,
         pub prob: Conv3d<B>,
         pub dist: Conv3d<B>,
         pub features_class: Option<Conv3d<B>>,
@@ -6428,6 +8139,32 @@ pub mod burn {
         )
     }
 
+    pub fn dist_loss_iou<B: Backend, const D: usize>(
+        dist_true_mask: Tensor<B, D>,
+        dist_pred: Tensor<B, D>,
+        n_rays: usize,
+        norm_by_mask: bool,
+    ) -> Tensor<B, 1> {
+        let eps = f32::EPSILON;
+        let dist_true = dist_true_mask.clone().narrow(1, 0, n_rays);
+        let dist_mask = dist_true_mask.narrow(1, n_rays, 1);
+        let inter = dist_pred.clone().sign()
+            * dist_true
+                .clone()
+                .min_pair(dist_pred.clone())
+                .powf_scalar(2.0);
+        let union = dist_true.max_pair(dist_pred).powf_scalar(2.0);
+        let inter = inter.mean_dim(1);
+        let union = union.mean_dim(1);
+        let raw_loss = union.clone().full_like(1.0) - inter / union.clone().add_scalar(eps);
+        let norm_mask = if norm_by_mask {
+            dist_mask.clone().mean().add_scalar(eps)
+        } else {
+            dist_mask.clone().full_like(1.0).mean()
+        };
+        (dist_mask * raw_loss / norm_mask.expand(union.shape())).mean()
+    }
+
     pub fn weighted_categorical_crossentropy_loss<B: Backend, const D: usize>(
         weights: &[f32],
         y_true: Tensor<B, D>,
@@ -6488,6 +8225,7 @@ pub mod burn {
                 config.train_background_reg,
                 true,
             ),
+            "iou" => dist_loss_iou(dist_true_mask, outputs.dist, config.n_rays, true),
             other => return Err(BurnTrainError::UnsupportedDistanceLoss(other.to_string())),
         }
         .mul_scalar(config.train_loss_weights[1]);
@@ -6540,6 +8278,7 @@ pub mod burn {
                 config.train_background_reg,
                 true,
             ),
+            "iou" => dist_loss_iou(dist_true_mask, outputs.dist, config.n_rays, true),
             other => return Err(BurnTrainError::UnsupportedDistanceLoss(other.to_string())),
         }
         .mul_scalar(config.train_loss_weights[1]);
@@ -6647,16 +8386,22 @@ pub mod burn {
         };
         let recorder = DefaultRecorder::new();
         let mut best_loss = f32::INFINITY;
-        let mut reduce_lr =
-            ReduceLrOnPlateauState::new(learning_rate, &model.config.train_reduce_lr);
+        let mut reduce_lr = model
+            .config
+            .train_reduce_lr
+            .as_ref()
+            .map(|config| ReduceLrOnPlateauState::new(learning_rate, config));
         let mut step = 0usize;
         for epoch in 0..epochs {
-            history.learning_rates.push(reduce_lr.current_lr);
+            let current_lr = reduce_lr
+                .as_ref()
+                .map(|state| state.current_lr)
+                .unwrap_or(learning_rate);
+            history.learning_rates.push(current_lr);
             let mut epoch_loss = 0.0f32;
             for _ in 0..steps_per_epoch {
                 let batch = train_batches[step % train_batches.len()].clone();
-                let (updated, loss) =
-                    stardist_2d_train_step(model, optimizer, batch, reduce_lr.current_lr)?;
+                let (updated, loss) = stardist_2d_train_step(model, optimizer, batch, current_lr)?;
                 let loss = loss.into_data();
                 let loss = loss
                     .as_slice::<f32>()
@@ -6719,7 +8464,9 @@ pub mod burn {
                     .unwrap_or_else(|| "NA".to_string());
                 writeln!(file, "{}\t{}\t{}", epoch + 1, loss, val_loss)?;
             }
-            reduce_lr.update(current_val_loss);
+            if let Some(reduce_lr) = &mut reduce_lr {
+                reduce_lr.update(current_val_loss);
+            }
         }
         if let Some(checkpoint) = &checkpoint {
             if let Some(last) = &checkpoint.last {
@@ -6790,16 +8537,22 @@ pub mod burn {
         };
         let recorder = DefaultRecorder::new();
         let mut best_loss = f32::INFINITY;
-        let mut reduce_lr =
-            ReduceLrOnPlateauState::new(learning_rate, &model.config.train_reduce_lr);
+        let mut reduce_lr = model
+            .config
+            .train_reduce_lr
+            .as_ref()
+            .map(|config| ReduceLrOnPlateauState::new(learning_rate, config));
         let mut step = 0usize;
         for epoch in 0..epochs {
-            history.learning_rates.push(reduce_lr.current_lr);
+            let current_lr = reduce_lr
+                .as_ref()
+                .map(|state| state.current_lr)
+                .unwrap_or(learning_rate);
+            history.learning_rates.push(current_lr);
             let mut epoch_loss = 0.0f32;
             for _ in 0..steps_per_epoch {
                 let batch = train_batches[step % train_batches.len()].clone();
-                let (updated, loss) =
-                    stardist_3d_train_step(model, optimizer, batch, reduce_lr.current_lr)?;
+                let (updated, loss) = stardist_3d_train_step(model, optimizer, batch, current_lr)?;
                 let loss = loss.into_data();
                 let loss = loss
                     .as_slice::<f32>()
@@ -6862,7 +8615,9 @@ pub mod burn {
                     .unwrap_or_else(|| "NA".to_string());
                 writeln!(file, "{}\t{}\t{}", epoch + 1, loss, val_loss)?;
             }
-            reduce_lr.update(current_val_loss);
+            if let Some(reduce_lr) = &mut reduce_lr {
+                reduce_lr.update(current_val_loss);
+            }
         }
         if let Some(checkpoint) = &checkpoint {
             if let Some(last) = &checkpoint.last {
@@ -7007,12 +8762,19 @@ pub mod burn {
         };
         let recorder = DefaultRecorder::new();
         let mut best_loss = f32::INFINITY;
-        let mut reduce_lr =
-            ReduceLrOnPlateauState::new(learning_rate, &model.config.train_reduce_lr);
+        let mut reduce_lr = model
+            .config
+            .train_reduce_lr
+            .as_ref()
+            .map(|config| ReduceLrOnPlateauState::new(learning_rate, config));
         let mut state = seed;
         let mut global_step = 0usize;
         for epoch in 0..epochs {
-            history.learning_rates.push(reduce_lr.current_lr);
+            let current_lr = reduce_lr
+                .as_ref()
+                .map(|state| state.current_lr)
+                .unwrap_or(learning_rate);
+            history.learning_rates.push(current_lr);
             let mut epoch_loss = 0.0f32;
             for _ in 0..steps_per_epoch {
                 let mut idx = Vec::<usize>::with_capacity(batch_size);
@@ -7034,8 +8796,7 @@ pub mod burn {
                     seed.wrapping_add(global_step as u64),
                 )?;
                 let batch = stardist_data2d_batch_to_tensors(&batch, device)?;
-                let (updated, loss) =
-                    stardist_2d_train_step(model, optimizer, batch, reduce_lr.current_lr)?;
+                let (updated, loss) = stardist_2d_train_step(model, optimizer, batch, current_lr)?;
                 let loss = loss.into_data();
                 let loss = loss
                     .as_slice::<f32>()
@@ -7098,7 +8859,9 @@ pub mod burn {
                     .unwrap_or_else(|| "NA".to_string());
                 writeln!(file, "{}\t{}\t{}", epoch + 1, loss, val_loss)?;
             }
-            reduce_lr.update(current_val_loss);
+            if let Some(reduce_lr) = &mut reduce_lr {
+                reduce_lr.update(current_val_loss);
+            }
         }
         if let Some(checkpoint) = &checkpoint {
             if let Some(last) = &checkpoint.last {
@@ -7260,12 +9023,19 @@ pub mod burn {
         };
         let recorder = DefaultRecorder::new();
         let mut best_loss = f32::INFINITY;
-        let mut reduce_lr =
-            ReduceLrOnPlateauState::new(learning_rate, &model.config.train_reduce_lr);
+        let mut reduce_lr = model
+            .config
+            .train_reduce_lr
+            .as_ref()
+            .map(|config| ReduceLrOnPlateauState::new(learning_rate, config));
         let mut state = seed;
         let mut global_step = 0usize;
         for epoch in 0..epochs {
-            history.learning_rates.push(reduce_lr.current_lr);
+            let current_lr = reduce_lr
+                .as_ref()
+                .map(|state| state.current_lr)
+                .unwrap_or(learning_rate);
+            history.learning_rates.push(current_lr);
             let mut epoch_loss = 0.0f32;
             for _ in 0..steps_per_epoch {
                 let mut idx = Vec::<usize>::with_capacity(batch_size);
@@ -7287,8 +9057,7 @@ pub mod burn {
                     seed.wrapping_add(global_step as u64),
                 )?;
                 let batch = stardist_data3d_batch_to_tensors(&batch, device)?;
-                let (updated, loss) =
-                    stardist_3d_train_step(model, optimizer, batch, reduce_lr.current_lr)?;
+                let (updated, loss) = stardist_3d_train_step(model, optimizer, batch, current_lr)?;
                 let loss = loss.into_data();
                 let loss = loss
                     .as_slice::<f32>()
@@ -7351,7 +9120,9 @@ pub mod burn {
                     .unwrap_or_else(|| "NA".to_string());
                 writeln!(file, "{}\t{}\t{}", epoch + 1, loss, val_loss)?;
             }
-            reduce_lr.update(current_val_loss);
+            if let Some(reduce_lr) = &mut reduce_lr {
+                reduce_lr.update(current_val_loss);
+            }
         }
         if let Some(checkpoint) = &checkpoint {
             if let Some(last) = &checkpoint.last {
@@ -7393,150 +9164,222 @@ pub mod burn {
 
     impl<B: Backend> StarDist2D<B> {
         pub fn init(config: crate::Config2D, device: &B::Device) -> Self {
-            Self {
-                conv2d_1: Conv2dConfig::new([config.n_channel_in, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                conv2d_2: Conv2dConfig::new([32, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                max_pooling2d_1: MaxPool2dConfig::new([2, 2]).init(),
-                down_level_0_no_0: Conv2dConfig::new([32, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                down_level_0_no_1: Conv2dConfig::new([32, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                max_0: MaxPool2dConfig::new(config.unet_pool).init(),
-                down_level_1_no_0: Conv2dConfig::new([32, 64], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                down_level_1_no_1: Conv2dConfig::new([64, 64], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                max_1: MaxPool2dConfig::new(config.unet_pool).init(),
-                down_level_2_no_0: Conv2dConfig::new([64, 128], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                down_level_2_no_1: Conv2dConfig::new([128, 128], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                max_2: MaxPool2dConfig::new(config.unet_pool).init(),
-                middle_0: Conv2dConfig::new([128, 256], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                middle_2: Conv2dConfig::new([256, 128], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_sampling2d_1: Interpolate2dConfig::new()
-                    .with_scale_factor(Some([2.0, 2.0]))
-                    .with_mode(InterpolateMode::Nearest)
-                    .init(),
-                up_level_2_no_0: Conv2dConfig::new([256, 128], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_level_2_no_2: Conv2dConfig::new([128, 64], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_sampling2d_2: Interpolate2dConfig::new()
-                    .with_scale_factor(Some([2.0, 2.0]))
-                    .with_mode(InterpolateMode::Nearest)
-                    .init(),
-                up_level_1_no_0: Conv2dConfig::new([128, 64], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_level_1_no_2: Conv2dConfig::new([64, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_sampling2d_3: Interpolate2dConfig::new()
-                    .with_scale_factor(Some([2.0, 2.0]))
-                    .with_mode(InterpolateMode::Nearest)
-                    .init(),
-                up_level_0_no_0: Conv2dConfig::new([64, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                up_level_0_no_2: Conv2dConfig::new([32, 32], config.unet_kernel_size)
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                features: Conv2dConfig::new(
-                    [32, config.net_conv_after_unet],
-                    config.unet_kernel_size,
-                )
-                .with_padding(PaddingConfig2d::Same)
-                .init(device),
-                prob: Conv2dConfig::new([config.net_conv_after_unet, 1], [1, 1])
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                dist: Conv2dConfig::new([config.net_conv_after_unet, config.n_rays], [1, 1])
-                    .with_padding(PaddingConfig2d::Same)
-                    .init(device),
-                features_class: if config.n_classes.is_some() {
-                    Some(
+            Self::try_init(config, device).expect("unsupported Burn StarDist2D config")
+        }
+
+        pub fn try_init(
+            config: crate::Config2D,
+            device: &B::Device,
+        ) -> Result<Self, BurnBuildError> {
+            if config.backbone != "unet" {
+                return Err(BurnBuildError::UnsupportedBackbone(config.backbone.clone()));
+            }
+            let mut pooled = [1usize, 1];
+            let mut channels = config.n_channel_in;
+            let mut pre_pool_convs = Vec::new();
+            let mut pre_pool_pools = Vec::new();
+            while pooled != config.grid {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                ];
+                if pool == [1, 1]
+                    || config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                {
+                    return Err(BurnBuildError::UnsupportedGrid);
+                }
+                for _ in 0..config.unet_n_conv_per_depth {
+                    pre_pool_convs.push(
                         Conv2dConfig::new(
-                            [32, config.net_conv_after_unet],
+                            [channels, config.unet_n_filter_base],
                             config.unet_kernel_size,
                         )
                         .with_padding(PaddingConfig2d::Same)
                         .init(device),
-                    )
-                } else {
-                    None
-                },
-                prob_class: config.n_classes.map(|n_classes| {
-                    Conv2dConfig::new([config.net_conv_after_unet, n_classes + 1], [1, 1])
-                        .with_padding(PaddingConfig2d::Same)
-                        .init(device)
-                }),
-                config,
+                    );
+                    channels = config.unet_n_filter_base;
+                }
+                pre_pool_pools.push(MaxPool2dConfig::new(pool).init());
+                pooled = [pooled[0] * pool[0], pooled[1] * pool[1]];
             }
-        }
 
-        pub fn forward(&self, input: Tensor<B, 4>) -> StarDist2DOutputs<B> {
-            let pooled_img = relu(self.conv2d_1.forward(input));
-            let pooled_img = relu(self.conv2d_2.forward(pooled_img));
-            let pooled_img = self.max_pooling2d_1.forward(pooled_img);
+            let mut down_levels = Vec::with_capacity(config.unet_n_depth);
+            let mut skip_channels = Vec::with_capacity(config.unet_n_depth);
+            for level in 0..config.unet_n_depth {
+                let out_channels = unet_channels(config.unet_n_filter_base, level);
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth {
+                    convs.push(
+                        Conv2dConfig::new([channels, out_channels], config.unet_kernel_size)
+                            .with_padding(PaddingConfig2d::Same)
+                            .init(device),
+                    );
+                    channels = out_channels;
+                }
+                skip_channels.push(channels);
+                down_levels.push(Unet2DLevel {
+                    convs,
+                    pool: MaxPool2dConfig::new(config.unet_pool).init(),
+                });
+            }
 
-            let down_level_0 = relu(self.down_level_0_no_0.forward(pooled_img));
-            let down_level_0 = relu(self.down_level_0_no_1.forward(down_level_0));
-            let max_0 = self.max_0.forward(down_level_0.clone());
+            let mut middle_convs = Vec::with_capacity(config.unet_n_conv_per_depth.max(1));
+            for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                let out_channels = unet_channels(config.unet_n_filter_base, config.unet_n_depth);
+                middle_convs.push(
+                    Conv2dConfig::new([channels, out_channels], config.unet_kernel_size)
+                        .with_padding(PaddingConfig2d::Same)
+                        .init(device),
+                );
+                channels = out_channels;
+            }
+            let middle_last_channels = unet_channels(
+                config.unet_n_filter_base,
+                config.unet_n_depth.saturating_sub(1),
+            );
+            middle_convs.push(
+                Conv2dConfig::new([channels, middle_last_channels], config.unet_kernel_size)
+                    .with_padding(PaddingConfig2d::Same)
+                    .init(device),
+            );
+            channels = middle_last_channels;
 
-            let down_level_1 = relu(self.down_level_1_no_0.forward(max_0));
-            let down_level_1 = relu(self.down_level_1_no_1.forward(down_level_1));
-            let max_1 = self.max_1.forward(down_level_1.clone());
+            let mut up_levels = Vec::with_capacity(config.unet_n_depth);
+            for level in (0..config.unet_n_depth).rev() {
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                channels += skip_channels[level];
+                for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                    let out_channels = unet_channels(config.unet_n_filter_base, level);
+                    convs.push(
+                        Conv2dConfig::new([channels, out_channels], config.unet_kernel_size)
+                            .with_padding(PaddingConfig2d::Same)
+                            .init(device),
+                    );
+                    channels = out_channels;
+                }
+                let out_channels =
+                    unet_channels(config.unet_n_filter_base, level.saturating_sub(1));
+                convs.push(
+                    Conv2dConfig::new([channels, out_channels], config.unet_kernel_size)
+                        .with_padding(PaddingConfig2d::Same)
+                        .init(device),
+                );
+                channels = out_channels;
+                up_levels.push(Unet2DUpLevel {
+                    upsample: Interpolate2dConfig::new()
+                        .with_scale_factor(Some([
+                            config.unet_pool[0] as f32,
+                            config.unet_pool[1] as f32,
+                        ]))
+                        .with_mode(InterpolateMode::Nearest)
+                        .init(),
+                    convs,
+                });
+            }
 
-            let down_level_2 = relu(self.down_level_2_no_0.forward(max_1));
-            let down_level_2 = relu(self.down_level_2_no_1.forward(down_level_2));
-            let max_2 = self.max_2.forward(down_level_2.clone());
-
-            let middle = relu(self.middle_0.forward(max_2));
-            let middle = relu(self.middle_2.forward(middle));
-
-            let up = self.up_sampling2d_1.forward(middle);
-            let up = Tensor::cat(vec![up, down_level_2], 1);
-            let up = relu(self.up_level_2_no_0.forward(up));
-            let up = relu(self.up_level_2_no_2.forward(up));
-
-            let up = self.up_sampling2d_2.forward(up);
-            let up = Tensor::cat(vec![up, down_level_1], 1);
-            let up = relu(self.up_level_1_no_0.forward(up));
-            let up = relu(self.up_level_1_no_2.forward(up));
-
-            let up = self.up_sampling2d_3.forward(up);
-            let up = Tensor::cat(vec![up, down_level_0], 1);
-            let up = relu(self.up_level_0_no_0.forward(up));
-            let up = relu(self.up_level_0_no_2.forward(up));
-
-            let features = relu(self.features.forward(up.clone()));
-            let prob = sigmoid(self.prob.forward(features.clone()));
-            let dist = self.dist.forward(features);
-            let prob_class = if let (Some(features_class), Some(prob_class)) =
-                (&self.features_class, &self.prob_class)
-            {
-                let class_features = relu(features_class.forward(up));
-                Some(softmax(prob_class.forward(class_features), 1))
+            let features = if config.net_conv_after_unet > 0 {
+                let layer = Conv2dConfig::new(
+                    [channels, config.net_conv_after_unet],
+                    config.unet_kernel_size,
+                )
+                .with_padding(PaddingConfig2d::Same)
+                .init(device);
+                channels = config.net_conv_after_unet;
+                Some(layer)
             } else {
                 None
             };
+            let prob = Conv2dConfig::new([channels, 1], [1, 1])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device);
+            let dist = Conv2dConfig::new([channels, config.n_rays], [1, 1])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device);
+            let class_head_channels = if config.net_conv_after_unet > 0 {
+                config.net_conv_after_unet
+            } else {
+                up_output_channels_2d(&config)
+            };
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_unet > 0 {
+                Some(
+                    Conv2dConfig::new(
+                        [up_output_channels_2d(&config), config.net_conv_after_unet],
+                        config.unet_kernel_size,
+                    )
+                    .with_padding(PaddingConfig2d::Same)
+                    .init(device),
+                )
+            } else {
+                None
+            };
+            let prob_class = config.n_classes.map(|n_classes| {
+                Conv2dConfig::new([class_head_channels, n_classes + 1], [1, 1])
+                    .with_padding(PaddingConfig2d::Same)
+                    .init(device)
+            });
+
+            Ok(Self {
+                config,
+                pre_pool_convs,
+                pre_pool_pools,
+                down_levels,
+                middle_convs,
+                up_levels,
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        pub fn forward(&self, input: Tensor<B, 4>) -> StarDist2DOutputs<B> {
+            let mut layer = input;
+            let mut conv_index = 0usize;
+            for pool in &self.pre_pool_pools {
+                for _ in 0..self.config.unet_n_conv_per_depth {
+                    layer = relu(self.pre_pool_convs[conv_index].forward(layer));
+                    conv_index += 1;
+                }
+                layer = pool.forward(layer);
+            }
+
+            let mut skips = Vec::with_capacity(self.down_levels.len());
+            for level in &self.down_levels {
+                for conv in &level.convs {
+                    layer = relu(conv.forward(layer));
+                }
+                skips.push(layer.clone());
+                layer = level.pool.forward(layer);
+            }
+            for conv in &self.middle_convs {
+                layer = relu(conv.forward(layer));
+            }
+            for (up_level, skip) in self.up_levels.iter().zip(skips.into_iter().rev()) {
+                layer = up_level.upsample.forward(layer);
+                layer = Tensor::cat(vec![layer, skip], 1);
+                for conv in &up_level.convs {
+                    layer = relu(conv.forward(layer));
+                }
+            }
+
+            let unet_base = layer.clone();
+            let features = self
+                .features
+                .as_ref()
+                .map(|features| relu(features.forward(layer.clone())))
+                .unwrap_or(layer);
+            let prob = sigmoid(self.prob.forward(features.clone()));
+            let dist = self.dist.forward(features);
+            let prob_class = self.prob_class.as_ref().map(|prob_class| {
+                let class_features = self
+                    .features_class
+                    .as_ref()
+                    .map(|features_class| relu(features_class.forward(unet_base.clone())))
+                    .unwrap_or(unet_base);
+                softmax(prob_class.forward(class_features), 1)
+            });
             StarDist2DOutputs {
                 prob,
                 dist,
@@ -7549,131 +9392,146 @@ pub mod burn {
             weights: &crate::KerasWeights,
             device: &B::Device,
         ) -> Result<Self, BurnWeightError> {
+            let mut channels = self.config.n_channel_in;
+            let mut auto_conv_index = 1usize;
+            for conv in &mut self.pre_pool_convs {
+                let out_channels = self.config.unet_n_filter_base;
+                let name = format!("conv2d_{auto_conv_index}/conv2d_{auto_conv_index}");
+                load_conv2d(
+                    conv,
+                    weights,
+                    &name,
+                    [
+                        out_channels,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = out_channels;
+                auto_conv_index += 1;
+            }
+            for (level_index, level) in self.down_levels.iter_mut().enumerate() {
+                let out_channels = unet_channels(self.config.unet_n_filter_base, level_index);
+                for (conv_index, conv) in level.convs.iter_mut().enumerate() {
+                    let name = format!(
+                        "down_level_{level_index}_no_{conv_index}/down_level_{level_index}_no_{conv_index}"
+                    );
+                    load_conv2d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+            }
+            let middle_len = self.middle_convs.len();
+            for (i, conv) in self.middle_convs.iter_mut().enumerate() {
+                let is_last = i + 1 == middle_len;
+                let name_index = if is_last {
+                    self.config.unet_n_conv_per_depth
+                } else {
+                    i
+                };
+                let out_channels = if is_last {
+                    unet_channels(
+                        self.config.unet_n_filter_base,
+                        self.config.unet_n_depth.saturating_sub(1),
+                    )
+                } else {
+                    unet_channels(self.config.unet_n_filter_base, self.config.unet_n_depth)
+                };
+                let name = format!("middle_{name_index}/middle_{name_index}");
+                load_conv2d(
+                    conv,
+                    weights,
+                    &name,
+                    [
+                        out_channels,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = out_channels;
+            }
+            for (up_position, up_level) in self.up_levels.iter_mut().enumerate() {
+                let level_index = self.config.unet_n_depth - 1 - up_position;
+                channels += unet_channels(self.config.unet_n_filter_base, level_index);
+                let up_len = up_level.convs.len();
+                for (conv_index, conv) in up_level.convs.iter_mut().enumerate() {
+                    let is_last = conv_index + 1 == up_len;
+                    let name_index = if is_last {
+                        self.config.unet_n_conv_per_depth
+                    } else {
+                        conv_index
+                    };
+                    let out_channels = if is_last {
+                        unet_channels(
+                            self.config.unet_n_filter_base,
+                            level_index.saturating_sub(1),
+                        )
+                    } else {
+                        unet_channels(self.config.unet_n_filter_base, level_index)
+                    };
+                    let name = format!(
+                        "up_level_{level_index}_no_{name_index}/up_level_{level_index}_no_{name_index}"
+                    );
+                    load_conv2d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+            }
+            let unet_base_channels = channels;
+            let head_channels = if let Some(features) = &mut self.features {
+                load_conv2d(
+                    features,
+                    weights,
+                    "features/features",
+                    [
+                        self.config.net_conv_after_unet,
+                        channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
+                    device,
+                )?;
+                channels = self.config.net_conv_after_unet;
+                channels
+            } else {
+                channels
+            };
             load_conv2d(
-                &mut self.conv2d_1,
+                &mut self.prob,
                 weights,
-                "conv2d_1/conv2d_1",
-                [32, self.config.n_channel_in, 3, 3],
+                "prob/prob",
+                [1, head_channels, 1, 1],
                 device,
             )?;
-            load_conv2d(
-                &mut self.conv2d_2,
-                weights,
-                "conv2d_2/conv2d_2",
-                [32, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_0_no_0,
-                weights,
-                "down_level_0_no_0/down_level_0_no_0",
-                [32, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_0_no_1,
-                weights,
-                "down_level_0_no_1/down_level_0_no_1",
-                [32, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_1_no_0,
-                weights,
-                "down_level_1_no_0/down_level_1_no_0",
-                [64, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_1_no_1,
-                weights,
-                "down_level_1_no_1/down_level_1_no_1",
-                [64, 64, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_2_no_0,
-                weights,
-                "down_level_2_no_0/down_level_2_no_0",
-                [128, 64, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.down_level_2_no_1,
-                weights,
-                "down_level_2_no_1/down_level_2_no_1",
-                [128, 128, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.middle_0,
-                weights,
-                "middle_0/middle_0",
-                [256, 128, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.middle_2,
-                weights,
-                "middle_2/middle_2",
-                [128, 256, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_2_no_0,
-                weights,
-                "up_level_2_no_0/up_level_2_no_0",
-                [128, 256, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_2_no_2,
-                weights,
-                "up_level_2_no_2/up_level_2_no_2",
-                [64, 128, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_1_no_0,
-                weights,
-                "up_level_1_no_0/up_level_1_no_0",
-                [64, 128, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_1_no_2,
-                weights,
-                "up_level_1_no_2/up_level_1_no_2",
-                [32, 64, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_0_no_0,
-                weights,
-                "up_level_0_no_0/up_level_0_no_0",
-                [32, 64, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.up_level_0_no_2,
-                weights,
-                "up_level_0_no_2/up_level_0_no_2",
-                [32, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(
-                &mut self.features,
-                weights,
-                "features/features",
-                [128, 32, 3, 3],
-                device,
-            )?;
-            load_conv2d(&mut self.prob, weights, "prob/prob", [1, 128, 1, 1], device)?;
             load_conv2d(
                 &mut self.dist,
                 weights,
                 "dist/dist",
-                [self.config.n_rays, 128, 1, 1],
+                [self.config.n_rays, head_channels, 1, 1],
                 device,
             )?;
             if let Some(features_class) = &mut self.features_class {
@@ -7681,17 +9539,27 @@ pub mod burn {
                     features_class,
                     weights,
                     "features_class/features_class",
-                    [128, 32, 3, 3],
+                    [
+                        self.config.net_conv_after_unet,
+                        unet_base_channels,
+                        self.config.unet_kernel_size[0],
+                        self.config.unet_kernel_size[1],
+                    ],
                     device,
                 )?;
             }
             if let Some(prob_class) = &mut self.prob_class {
                 let n_classes = self.config.n_classes.unwrap_or(0);
+                let class_head_channels = if self.config.net_conv_after_unet > 0 {
+                    self.config.net_conv_after_unet
+                } else {
+                    unet_base_channels
+                };
                 load_conv2d(
                     prob_class,
                     weights,
                     "prob_class/prob_class",
-                    [n_classes + 1, 128, 1, 1],
+                    [n_classes + 1, class_head_channels, 1, 1],
                     device,
                 )?;
             }
@@ -7701,144 +9569,399 @@ pub mod burn {
 
     impl<B: Backend> StarDist3D<B> {
         pub fn init(config: crate::config::Config3D, device: &B::Device) -> Self {
-            Self {
-                conv3d_1: Conv3dConfig::new([config.n_channel_in, 32], [7, 7, 7])
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_2: Conv3dConfig::new([32, 32], [3, 3, 3])
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_3: Conv3dConfig::new([32, 64], config.resnet_kernel_size)
-                    .with_stride([1, 2, 2])
-                    .with_padding(PaddingConfig3d::Valid)
-                    .init(device),
-                conv3d_4: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_5: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_6: Conv3dConfig::new([32, 64], [1, 1, 1])
-                    .with_stride([1, 2, 2])
-                    .with_padding(PaddingConfig3d::Valid)
-                    .init(device),
-                conv3d_7: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_8: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_9: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_10: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_11: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_12: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_13: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_14: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                conv3d_15: Conv3dConfig::new([64, 64], config.resnet_kernel_size)
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                features: Conv3dConfig::new(
-                    [64, config.net_conv_after_resnet],
-                    config.resnet_kernel_size,
-                )
+            Self::try_init(config, device).expect("unsupported Burn StarDist3D config")
+        }
+
+        pub fn try_init(
+            config: crate::config::Config3D,
+            device: &B::Device,
+        ) -> Result<Self, BurnBuildError> {
+            if config.backbone == "unet" {
+                return Self::try_init_unet(config, device);
+            }
+            if config.backbone != "resnet" {
+                return Err(BurnBuildError::UnsupportedBackbone(config.backbone.clone()));
+            }
+            if config.resnet_n_conv_per_block < 2 {
+                return Err(BurnBuildError::InvalidResnetConvPerBlock);
+            }
+            let mut channels = config.resnet_n_filter_base;
+            let initial_7 = Conv3dConfig::new([config.n_channel_in, channels], [7, 7, 7])
                 .with_padding(PaddingConfig3d::Same)
-                .init(device),
-                prob: Conv3dConfig::new([config.net_conv_after_resnet, 1], [1, 1, 1])
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                dist: Conv3dConfig::new([config.net_conv_after_resnet, config.n_rays], [1, 1, 1])
-                    .with_padding(PaddingConfig3d::Same)
-                    .init(device),
-                features_class: if config.n_classes.is_some() {
-                    Some(
-                        Conv3dConfig::new(
-                            [64, config.net_conv_after_resnet],
-                            config.resnet_kernel_size,
-                        )
+                .init(device);
+            let initial_3 = Conv3dConfig::new([channels, channels], [3, 3, 3])
+                .with_padding(PaddingConfig3d::Same)
+                .init(device);
+            let mut pooled = [1usize, 1, 1];
+            let mut resnet_blocks = Vec::with_capacity(config.resnet_n_blocks);
+            for _ in 0..config.resnet_n_blocks {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                    if config.grid[2] > pooled[2] { 2 } else { 1 },
+                ];
+                if pool == [1, 1, 1] && pooled != config.grid {
+                    return Err(BurnBuildError::UnsupportedGrid);
+                }
+                if config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                    || config.grid[2] % (pooled[2] * pool[2]) != 0
+                {
+                    return Err(BurnBuildError::UnsupportedGrid);
+                }
+                let out_channels = if pool.iter().any(|p| *p > 1) {
+                    channels * 2
+                } else {
+                    channels
+                };
+                let mut convs = Vec::with_capacity(config.resnet_n_conv_per_block);
+                let first_padding = if pool.iter().any(|p| *p > 1) {
+                    PaddingConfig3d::Valid
+                } else {
+                    PaddingConfig3d::Same
+                };
+                convs.push(
+                    Conv3dConfig::new([channels, out_channels], config.resnet_kernel_size)
+                        .with_stride(pool)
+                        .with_padding(first_padding)
+                        .init(device),
+                );
+                for _ in 0..config.resnet_n_conv_per_block - 2 {
+                    convs.push(
+                        Conv3dConfig::new([out_channels, out_channels], config.resnet_kernel_size)
+                            .with_padding(PaddingConfig3d::Same)
+                            .init(device),
+                    );
+                }
+                convs.push(
+                    Conv3dConfig::new([out_channels, out_channels], config.resnet_kernel_size)
                         .with_padding(PaddingConfig3d::Same)
                         .init(device),
+                );
+                let shortcut = if pool.iter().any(|p| *p > 1) || out_channels != channels {
+                    Some(
+                        Conv3dConfig::new([channels, out_channels], [1, 1, 1])
+                            .with_stride(pool)
+                            .with_padding(PaddingConfig3d::Valid)
+                            .init(device),
                     )
                 } else {
                     None
-                },
-                prob_class: config.n_classes.map(|n_classes| {
-                    Conv3dConfig::new([config.net_conv_after_resnet, n_classes + 1], [1, 1, 1])
-                        .with_padding(PaddingConfig3d::Same)
-                        .init(device)
-                }),
-                config,
+                };
+                resnet_blocks.push(Resnet3DBlock {
+                    convs,
+                    shortcut,
+                    pool,
+                });
+                channels = out_channels;
+                pooled = [
+                    pooled[0] * pool[0],
+                    pooled[1] * pool[1],
+                    pooled[2] * pool[2],
+                ];
             }
-        }
-
-        pub fn forward(&self, input: Tensor<B, 5>) -> StarDist3DOutputs<B> {
-            let layer = self.conv3d_1.forward(input);
-            let layer = self.conv3d_2.forward(layer);
-
-            let shortcut = self.conv3d_6.forward(layer.clone());
-            let [_batch, _channel, depth, height, width] = layer.dims();
-            let out_depth = depth.div_ceil(1);
-            let out_height = height.div_ceil(2);
-            let out_width = width.div_ceil(2);
-            let pad_depth = ((out_depth - 1) * 1 + 3).saturating_sub(depth);
-            let pad_height = ((out_height - 1) * 2 + 3).saturating_sub(height);
-            let pad_width = ((out_width - 1) * 2 + 3).saturating_sub(width);
-            let layer_same = layer.pad(
-                [
-                    (0, 0),
-                    (0, 0),
-                    (pad_depth / 2, pad_depth - pad_depth / 2),
-                    (pad_height / 2, pad_height - pad_height / 2),
-                    (pad_width / 2, pad_width - pad_width / 2),
-                ],
-                BurnPadMode::Constant(0.0),
-            );
-            let block = relu(self.conv3d_3.forward(layer_same));
-            let block = relu(self.conv3d_4.forward(block));
-            let block = self.conv3d_5.forward(block);
-            let layer = relu(block + shortcut);
-
-            let shortcut = layer.clone();
-            let block = relu(self.conv3d_7.forward(layer));
-            let block = relu(self.conv3d_8.forward(block));
-            let block = self.conv3d_9.forward(block);
-            let layer = relu(block + shortcut);
-
-            let shortcut = layer.clone();
-            let block = relu(self.conv3d_10.forward(layer));
-            let block = relu(self.conv3d_11.forward(block));
-            let block = self.conv3d_12.forward(block);
-            let layer = relu(block + shortcut);
-
-            let shortcut = layer.clone();
-            let block = relu(self.conv3d_13.forward(layer));
-            let block = relu(self.conv3d_14.forward(block));
-            let block = self.conv3d_15.forward(block);
-            let layer = relu(block + shortcut);
-
-            let layer_base = layer;
-            let features = relu(self.features.forward(layer_base.clone()));
-            let prob = sigmoid(self.prob.forward(features.clone()));
-            let dist = self.dist.forward(features);
-            let prob_class = if let (Some(features_class), Some(prob_class)) =
-                (&self.features_class, &self.prob_class)
-            {
-                let class_features = relu(features_class.forward(layer_base));
-                Some(softmax(prob_class.forward(class_features), 1))
+            let features = if config.net_conv_after_resnet > 0 {
+                Some(
+                    Conv3dConfig::new(
+                        [channels, config.net_conv_after_resnet],
+                        config.resnet_kernel_size,
+                    )
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device),
+                )
             } else {
                 None
             };
+            let head_channels = if config.net_conv_after_resnet > 0 {
+                config.net_conv_after_resnet
+            } else {
+                channels
+            };
+            let prob = Conv3dConfig::new([head_channels, 1], [1, 1, 1])
+                .with_padding(PaddingConfig3d::Same)
+                .init(device);
+            let dist = Conv3dConfig::new([head_channels, config.n_rays], [1, 1, 1])
+                .with_padding(PaddingConfig3d::Same)
+                .init(device);
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_resnet > 0 {
+                Some(
+                    Conv3dConfig::new(
+                        [channels, config.net_conv_after_resnet],
+                        config.resnet_kernel_size,
+                    )
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device),
+                )
+            } else {
+                None
+            };
+            let prob_class = config.n_classes.map(|n_classes| {
+                Conv3dConfig::new([head_channels, n_classes + 1], [1, 1, 1])
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device)
+            });
+            Ok(Self {
+                config,
+                initial_7: Some(initial_7),
+                initial_3: Some(initial_3),
+                resnet_blocks,
+                unet_pre_pool_convs: Vec::new(),
+                unet_pre_pool_pools: Vec::new(),
+                unet_down_levels: Vec::new(),
+                unet_middle_convs: Vec::new(),
+                unet_up_levels: Vec::new(),
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        fn try_init_unet(
+            config: crate::config::Config3D,
+            device: &B::Device,
+        ) -> Result<Self, BurnBuildError> {
+            let mut pooled = [1usize, 1, 1];
+            let mut channels = config.n_channel_in;
+            let mut unet_pre_pool_convs = Vec::new();
+            let mut unet_pre_pool_pools = Vec::new();
+            while pooled != config.grid {
+                let pool = [
+                    if config.grid[0] > pooled[0] { 2 } else { 1 },
+                    if config.grid[1] > pooled[1] { 2 } else { 1 },
+                    if config.grid[2] > pooled[2] { 2 } else { 1 },
+                ];
+                if pool == [1, 1, 1]
+                    || config.grid[0] % (pooled[0] * pool[0]) != 0
+                    || config.grid[1] % (pooled[1] * pool[1]) != 0
+                    || config.grid[2] % (pooled[2] * pool[2]) != 0
+                {
+                    return Err(BurnBuildError::UnsupportedGrid);
+                }
+                for _ in 0..config.unet_n_conv_per_depth {
+                    unet_pre_pool_convs.push(
+                        Conv3dConfig::new(
+                            [channels, config.unet_n_filter_base],
+                            config.unet_kernel_size,
+                        )
+                        .with_padding(PaddingConfig3d::Same)
+                        .init(device),
+                    );
+                    channels = config.unet_n_filter_base;
+                }
+                unet_pre_pool_pools.push(pool);
+                pooled = [
+                    pooled[0] * pool[0],
+                    pooled[1] * pool[1],
+                    pooled[2] * pool[2],
+                ];
+            }
+
+            let mut unet_down_levels = Vec::with_capacity(config.unet_n_depth);
+            let mut skip_channels = Vec::with_capacity(config.unet_n_depth);
+            for level in 0..config.unet_n_depth {
+                let out_channels = unet_channels(config.unet_n_filter_base, level);
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth {
+                    convs.push(
+                        Conv3dConfig::new([channels, out_channels], config.unet_kernel_size)
+                            .with_padding(PaddingConfig3d::Same)
+                            .init(device),
+                    );
+                    channels = out_channels;
+                }
+                skip_channels.push(channels);
+                unet_down_levels.push(Unet3DLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+
+            let mut unet_middle_convs = Vec::with_capacity(config.unet_n_conv_per_depth.max(1));
+            for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                let out_channels = unet_channels(config.unet_n_filter_base, config.unet_n_depth);
+                unet_middle_convs.push(
+                    Conv3dConfig::new([channels, out_channels], config.unet_kernel_size)
+                        .with_padding(PaddingConfig3d::Same)
+                        .init(device),
+                );
+                channels = out_channels;
+            }
+            let middle_last_channels = unet_channels(
+                config.unet_n_filter_base,
+                config.unet_n_depth.saturating_sub(1),
+            );
+            unet_middle_convs.push(
+                Conv3dConfig::new([channels, middle_last_channels], config.unet_kernel_size)
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device),
+            );
+            channels = middle_last_channels;
+
+            let mut unet_up_levels = Vec::with_capacity(config.unet_n_depth);
+            for level in (0..config.unet_n_depth).rev() {
+                channels += skip_channels[level];
+                let mut convs = Vec::with_capacity(config.unet_n_conv_per_depth);
+                for _ in 0..config.unet_n_conv_per_depth.saturating_sub(1) {
+                    let out_channels = unet_channels(config.unet_n_filter_base, level);
+                    convs.push(
+                        Conv3dConfig::new([channels, out_channels], config.unet_kernel_size)
+                            .with_padding(PaddingConfig3d::Same)
+                            .init(device),
+                    );
+                    channels = out_channels;
+                }
+                let out_channels =
+                    unet_channels(config.unet_n_filter_base, level.saturating_sub(1));
+                convs.push(
+                    Conv3dConfig::new([channels, out_channels], config.unet_kernel_size)
+                        .with_padding(PaddingConfig3d::Same)
+                        .init(device),
+                );
+                channels = out_channels;
+                unet_up_levels.push(Unet3DUpLevel {
+                    convs,
+                    pool: config.unet_pool,
+                });
+            }
+
+            let unet_base_channels = channels;
+            let features = if config.net_conv_after_unet > 0 {
+                Some(
+                    Conv3dConfig::new(
+                        [channels, config.net_conv_after_unet],
+                        config.unet_kernel_size,
+                    )
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device),
+                )
+            } else {
+                None
+            };
+            let head_channels = if config.net_conv_after_unet > 0 {
+                config.net_conv_after_unet
+            } else {
+                channels
+            };
+            let prob = Conv3dConfig::new([head_channels, 1], [1, 1, 1])
+                .with_padding(PaddingConfig3d::Same)
+                .init(device);
+            let dist = Conv3dConfig::new([head_channels, config.n_rays], [1, 1, 1])
+                .with_padding(PaddingConfig3d::Same)
+                .init(device);
+            let features_class = if config.n_classes.is_some() && config.net_conv_after_unet > 0 {
+                Some(
+                    Conv3dConfig::new(
+                        [unet_base_channels, config.net_conv_after_unet],
+                        config.unet_kernel_size,
+                    )
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device),
+                )
+            } else {
+                None
+            };
+            let prob_class = config.n_classes.map(|n_classes| {
+                Conv3dConfig::new([head_channels, n_classes + 1], [1, 1, 1])
+                    .with_padding(PaddingConfig3d::Same)
+                    .init(device)
+            });
+            Ok(Self {
+                config,
+                initial_7: None,
+                initial_3: None,
+                resnet_blocks: Vec::new(),
+                unet_pre_pool_convs,
+                unet_pre_pool_pools,
+                unet_down_levels,
+                unet_middle_convs,
+                unet_up_levels,
+                features,
+                prob,
+                dist,
+                features_class,
+                prob_class,
+            })
+        }
+
+        pub fn forward(&self, input: Tensor<B, 5>) -> StarDist3DOutputs<B> {
+            let layer_base = if self.config.backbone == "unet" {
+                let mut layer = input;
+                let mut conv_index = 0usize;
+                for pool in &self.unet_pre_pool_pools {
+                    for _ in 0..self.config.unet_n_conv_per_depth {
+                        layer = relu(self.unet_pre_pool_convs[conv_index].forward(layer));
+                        conv_index += 1;
+                    }
+                    layer = max_pool3d_valid(layer, *pool);
+                }
+                let mut skips = Vec::with_capacity(self.unet_down_levels.len());
+                for level in &self.unet_down_levels {
+                    for conv in &level.convs {
+                        layer = relu(conv.forward(layer));
+                    }
+                    skips.push(layer.clone());
+                    layer = max_pool3d_valid(layer, level.pool);
+                }
+                for conv in &self.unet_middle_convs {
+                    layer = relu(conv.forward(layer));
+                }
+                for (up_level, skip) in self.unet_up_levels.iter().zip(skips.into_iter().rev()) {
+                    layer = upsample3d_nearest(layer, up_level.pool);
+                    layer = Tensor::cat(vec![layer, skip], 1);
+                    for conv in &up_level.convs {
+                        layer = relu(conv.forward(layer));
+                    }
+                }
+                layer
+            } else {
+                let mut layer = self
+                    .initial_7
+                    .as_ref()
+                    .expect("missing 3D resnet initial_7")
+                    .forward(input);
+                layer = self
+                    .initial_3
+                    .as_ref()
+                    .expect("missing 3D resnet initial_3")
+                    .forward(layer);
+                for block in &self.resnet_blocks {
+                    let shortcut = block
+                        .shortcut
+                        .as_ref()
+                        .map(|shortcut| shortcut.forward(layer.clone()))
+                        .unwrap_or_else(|| layer.clone());
+                    let mut residual = if block.pool.iter().any(|p| *p > 1) {
+                        conv3d_same_for_stride(layer, block.pool, self.config.resnet_kernel_size)
+                    } else {
+                        layer
+                    };
+                    for (i, conv) in block.convs.iter().enumerate() {
+                        residual = conv.forward(residual);
+                        if i + 1 != block.convs.len() {
+                            residual = relu(residual);
+                        }
+                    }
+                    layer = relu(residual + shortcut);
+                }
+                layer
+            };
+            let features = self
+                .features
+                .as_ref()
+                .map(|features| relu(features.forward(layer_base.clone())))
+                .unwrap_or_else(|| layer_base.clone());
+            let prob = sigmoid(self.prob.forward(features.clone()));
+            let dist = self.dist.forward(features);
+            let prob_class = self.prob_class.as_ref().map(|prob_class| {
+                let class_features = self
+                    .features_class
+                    .as_ref()
+                    .map(|features_class| relu(features_class.forward(layer_base.clone())))
+                    .unwrap_or(layer_base);
+                softmax(prob_class.forward(class_features), 1)
+            });
             StarDist3DOutputs {
                 prob,
                 dist,
@@ -7851,130 +9974,271 @@ pub mod burn {
             weights: &crate::KerasWeights,
             device: &B::Device,
         ) -> Result<Self, BurnWeightError> {
+            if self.config.backbone == "unet" {
+                let mut channels = self.config.n_channel_in;
+                let mut auto_conv_index = 1usize;
+                for conv in &mut self.unet_pre_pool_convs {
+                    let out_channels = self.config.unet_n_filter_base;
+                    let name = format!("conv3d_{auto_conv_index}/conv3d_{auto_conv_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                    auto_conv_index += 1;
+                }
+                for (level_index, level) in self.unet_down_levels.iter_mut().enumerate() {
+                    let out_channels = unet_channels(self.config.unet_n_filter_base, level_index);
+                    for (conv_index, conv) in level.convs.iter_mut().enumerate() {
+                        let name = format!(
+                            "down_level_{level_index}_no_{conv_index}/down_level_{level_index}_no_{conv_index}"
+                        );
+                        load_conv3d(
+                            conv,
+                            weights,
+                            &name,
+                            [
+                                out_channels,
+                                channels,
+                                self.config.unet_kernel_size[0],
+                                self.config.unet_kernel_size[1],
+                                self.config.unet_kernel_size[2],
+                            ],
+                            device,
+                        )?;
+                        channels = out_channels;
+                    }
+                }
+                let middle_len = self.unet_middle_convs.len();
+                for (i, conv) in self.unet_middle_convs.iter_mut().enumerate() {
+                    let is_last = i + 1 == middle_len;
+                    let name_index = if is_last {
+                        self.config.unet_n_conv_per_depth
+                    } else {
+                        i
+                    };
+                    let out_channels = if is_last {
+                        unet_channels(
+                            self.config.unet_n_filter_base,
+                            self.config.unet_n_depth.saturating_sub(1),
+                        )
+                    } else {
+                        unet_channels(self.config.unet_n_filter_base, self.config.unet_n_depth)
+                    };
+                    let name = format!("middle_{name_index}/middle_{name_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                }
+                for (up_position, up_level) in self.unet_up_levels.iter_mut().enumerate() {
+                    let level_index = self.config.unet_n_depth - 1 - up_position;
+                    channels += unet_channels(self.config.unet_n_filter_base, level_index);
+                    let up_len = up_level.convs.len();
+                    for (conv_index, conv) in up_level.convs.iter_mut().enumerate() {
+                        let is_last = conv_index + 1 == up_len;
+                        let name_index = if is_last {
+                            self.config.unet_n_conv_per_depth
+                        } else {
+                            conv_index
+                        };
+                        let out_channels = if is_last {
+                            unet_channels(
+                                self.config.unet_n_filter_base,
+                                level_index.saturating_sub(1),
+                            )
+                        } else {
+                            unet_channels(self.config.unet_n_filter_base, level_index)
+                        };
+                        let name = format!(
+                            "up_level_{level_index}_no_{name_index}/up_level_{level_index}_no_{name_index}"
+                        );
+                        load_conv3d(
+                            conv,
+                            weights,
+                            &name,
+                            [
+                                out_channels,
+                                channels,
+                                self.config.unet_kernel_size[0],
+                                self.config.unet_kernel_size[1],
+                                self.config.unet_kernel_size[2],
+                            ],
+                            device,
+                        )?;
+                        channels = out_channels;
+                    }
+                }
+                let unet_base_channels = channels;
+                let head_channels = if let Some(features) = &mut self.features {
+                    load_conv3d(
+                        features,
+                        weights,
+                        "features/features",
+                        [
+                            self.config.net_conv_after_unet,
+                            channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    self.config.net_conv_after_unet
+                } else {
+                    unet_base_channels
+                };
+                load_conv3d(
+                    &mut self.prob,
+                    weights,
+                    "prob/prob",
+                    [1, head_channels, 1, 1, 1],
+                    device,
+                )?;
+                load_conv3d(
+                    &mut self.dist,
+                    weights,
+                    "dist/dist",
+                    [self.config.n_rays, head_channels, 1, 1, 1],
+                    device,
+                )?;
+                if let Some(features_class) = &mut self.features_class {
+                    load_conv3d(
+                        features_class,
+                        weights,
+                        "features_class/features_class",
+                        [
+                            self.config.net_conv_after_unet,
+                            unet_base_channels,
+                            self.config.unet_kernel_size[0],
+                            self.config.unet_kernel_size[1],
+                            self.config.unet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                }
+                if let Some(prob_class) = &mut self.prob_class {
+                    let n_classes = self.config.n_classes.unwrap_or(0);
+                    let class_head_channels = if self.config.net_conv_after_unet > 0 {
+                        self.config.net_conv_after_unet
+                    } else {
+                        unet_base_channels
+                    };
+                    load_conv3d(
+                        prob_class,
+                        weights,
+                        "prob_class/prob_class",
+                        [n_classes + 1, class_head_channels, 1, 1, 1],
+                        device,
+                    )?;
+                }
+                return Ok(self);
+            }
+            let mut channels = self.config.resnet_n_filter_base;
+            let mut conv_index = 1usize;
             load_conv3d(
-                &mut self.conv3d_1,
+                self.initial_7
+                    .as_mut()
+                    .expect("missing 3D resnet initial_7"),
                 weights,
                 "conv3d_1/conv3d_1",
-                [32, 1, 7, 7, 7],
+                [channels, self.config.n_channel_in, 7, 7, 7],
                 device,
             )?;
+            conv_index += 1;
             load_conv3d(
-                &mut self.conv3d_2,
+                self.initial_3
+                    .as_mut()
+                    .expect("missing 3D resnet initial_3"),
                 weights,
                 "conv3d_2/conv3d_2",
-                [32, 32, 3, 3, 3],
+                [channels, channels, 3, 3, 3],
                 device,
             )?;
-            load_conv3d(
-                &mut self.conv3d_3,
-                weights,
-                "conv3d_3/conv3d_3",
-                [64, 32, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_4,
-                weights,
-                "conv3d_4/conv3d_4",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_5,
-                weights,
-                "conv3d_5/conv3d_5",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_6,
-                weights,
-                "conv3d_6/conv3d_6",
-                [64, 32, 1, 1, 1],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_7,
-                weights,
-                "conv3d_7/conv3d_7",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_8,
-                weights,
-                "conv3d_8/conv3d_8",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_9,
-                weights,
-                "conv3d_9/conv3d_9",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_10,
-                weights,
-                "conv3d_10/conv3d_10",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_11,
-                weights,
-                "conv3d_11/conv3d_11",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_12,
-                weights,
-                "conv3d_12/conv3d_12",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_13,
-                weights,
-                "conv3d_13/conv3d_13",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_14,
-                weights,
-                "conv3d_14/conv3d_14",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.conv3d_15,
-                weights,
-                "conv3d_15/conv3d_15",
-                [64, 64, 3, 3, 3],
-                device,
-            )?;
-            load_conv3d(
-                &mut self.features,
-                weights,
-                "features/features",
-                [128, 64, 3, 3, 3],
-                device,
-            )?;
+            conv_index += 1;
+            for block in &mut self.resnet_blocks {
+                let out_channels = block.convs[0].weight.val().dims()[0];
+                for conv in &mut block.convs {
+                    let name = format!("conv3d_{conv_index}/conv3d_{conv_index}");
+                    load_conv3d(
+                        conv,
+                        weights,
+                        &name,
+                        [
+                            out_channels,
+                            channels,
+                            self.config.resnet_kernel_size[0],
+                            self.config.resnet_kernel_size[1],
+                            self.config.resnet_kernel_size[2],
+                        ],
+                        device,
+                    )?;
+                    channels = out_channels;
+                    conv_index += 1;
+                }
+                if let Some(shortcut) = &mut block.shortcut {
+                    let name = format!("conv3d_{conv_index}/conv3d_{conv_index}");
+                    let in_channels = shortcut.weight.val().dims()[1];
+                    load_conv3d(
+                        shortcut,
+                        weights,
+                        &name,
+                        [out_channels, in_channels, 1, 1, 1],
+                        device,
+                    )?;
+                    conv_index += 1;
+                }
+            }
+            let layer_base_channels = channels;
+            let head_channels = if let Some(features) = &mut self.features {
+                load_conv3d(
+                    features,
+                    weights,
+                    "features/features",
+                    [
+                        self.config.net_conv_after_resnet,
+                        layer_base_channels,
+                        self.config.resnet_kernel_size[0],
+                        self.config.resnet_kernel_size[1],
+                        self.config.resnet_kernel_size[2],
+                    ],
+                    device,
+                )?;
+                self.config.net_conv_after_resnet
+            } else {
+                layer_base_channels
+            };
             load_conv3d(
                 &mut self.prob,
                 weights,
                 "prob/prob",
-                [1, 128, 1, 1, 1],
+                [1, head_channels, 1, 1, 1],
                 device,
             )?;
             load_conv3d(
                 &mut self.dist,
                 weights,
                 "dist/dist",
-                [self.config.n_rays, 128, 1, 1, 1],
+                [self.config.n_rays, head_channels, 1, 1, 1],
                 device,
             )?;
             if let Some(features_class) = &mut self.features_class {
@@ -7982,22 +10246,93 @@ pub mod burn {
                     features_class,
                     weights,
                     "features_class/features_class",
-                    [128, 64, 3, 3, 3],
+                    [
+                        self.config.net_conv_after_resnet,
+                        layer_base_channels,
+                        self.config.resnet_kernel_size[0],
+                        self.config.resnet_kernel_size[1],
+                        self.config.resnet_kernel_size[2],
+                    ],
                     device,
                 )?;
             }
             if let Some(prob_class) = &mut self.prob_class {
                 let n_classes = self.config.n_classes.unwrap_or(0);
+                let class_head_channels = if self.config.net_conv_after_resnet > 0 {
+                    self.config.net_conv_after_resnet
+                } else {
+                    layer_base_channels
+                };
                 load_conv3d(
                     prob_class,
                     weights,
                     "prob_class/prob_class",
-                    [n_classes + 1, 128, 1, 1, 1],
+                    [n_classes + 1, class_head_channels, 1, 1, 1],
                     device,
                 )?;
             }
             Ok(self)
         }
+    }
+
+    fn unet_channels(base: usize, level: usize) -> usize {
+        base * (1usize << level)
+    }
+
+    fn up_output_channels_2d(config: &crate::Config2D) -> usize {
+        unet_channels(config.unet_n_filter_base, 0)
+    }
+
+    fn conv3d_same_for_stride<B: Backend>(
+        layer: Tensor<B, 5>,
+        stride: [usize; 3],
+        kernel: [usize; 3],
+    ) -> Tensor<B, 5> {
+        if stride == [1, 1, 1] {
+            return layer;
+        }
+        let [_batch, _channel, depth, height, width] = layer.dims();
+        let out_depth = depth.div_ceil(stride[0]);
+        let out_height = height.div_ceil(stride[1]);
+        let out_width = width.div_ceil(stride[2]);
+        let pad_depth = ((out_depth - 1) * stride[0] + kernel[0]).saturating_sub(depth);
+        let pad_height = ((out_height - 1) * stride[1] + kernel[1]).saturating_sub(height);
+        let pad_width = ((out_width - 1) * stride[2] + kernel[2]).saturating_sub(width);
+        layer.pad(
+            [
+                (0, 0),
+                (0, 0),
+                (pad_depth / 2, pad_depth - pad_depth / 2),
+                (pad_height / 2, pad_height - pad_height / 2),
+                (pad_width / 2, pad_width - pad_width / 2),
+            ],
+            BurnPadMode::Constant(0.0),
+        )
+    }
+
+    fn max_pool3d_valid<B: Backend>(layer: Tensor<B, 5>, pool: [usize; 3]) -> Tensor<B, 5> {
+        if pool == [1, 1, 1] {
+            return layer;
+        }
+        let [batch, channels, depth, height, width] = layer.dims();
+        let out_depth = depth / pool[0];
+        let out_height = height / pool[1];
+        let out_width = width / pool[2];
+        layer
+            .reshape([
+                batch, channels, out_depth, pool[0], out_height, pool[1], out_width, pool[2],
+            ])
+            .max_dim(7)
+            .max_dim(5)
+            .max_dim(3)
+            .reshape([batch, channels, out_depth, out_height, out_width])
+    }
+
+    fn upsample3d_nearest<B: Backend>(layer: Tensor<B, 5>, scale: [usize; 3]) -> Tensor<B, 5> {
+        layer
+            .repeat_dim(2, scale[0])
+            .repeat_dim(3, scale[1])
+            .repeat_dim(4, scale[2])
     }
 
     fn load_conv2d<B: Backend>(
@@ -9090,18 +11425,15 @@ mod tests {
             }
         );
         assert_eq!(
-            StarDistThresholds::new(Some(0.7), Some(0.3)),
+            StarDistThresholds::new(0.7, 0.3).unwrap(),
             StarDistThresholds {
                 prob: 0.7,
                 nms: 0.3
             }
         );
         assert_eq!(
-            StarDistThresholds::new(Some(1.5), Some(f32::NAN)),
-            StarDistThresholds {
-                prob: 0.5,
-                nms: 0.4
-            }
+            StarDistThresholds::new(1.5, f32::NAN).unwrap_err(),
+            ThresholdsError::InvalidProb
         );
     }
 
@@ -9715,9 +12047,10 @@ mod tests {
         config.train_dist_loss = "mae".to_string();
         config.train_loss_weights = vec![1.0, 0.2];
         config.train_background_reg = 0.0;
-        config.train_reduce_lr.factor = 0.25;
-        config.train_reduce_lr.patience = 1;
-        config.train_reduce_lr.min_delta = f32::MAX;
+        let reduce_lr = config.train_reduce_lr.as_mut().unwrap();
+        reduce_lr.factor = 0.25;
+        reduce_lr.patience = 1;
+        reduce_lr.min_delta = f32::MAX;
 
         let model = burn::StarDist2D::<B>::init(config.clone(), &device);
         let batch = burn::StarDistData2DBatchTensors {
@@ -10825,6 +13158,481 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "candle", feature = "hdf5"))]
+    #[test]
+    fn candle_2d_model_loads_keras_weights_and_runs_forward() {
+        let weights_path = "stardist/models/examples/2D_demo/weights_best.h5";
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+        let device = ::candle_core::Device::Cpu;
+        let config =
+            Config2D::from_json_file("assets/models/examples/2D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let model = candle::StarDist2D::init(config, &device)
+            .load_keras_weights(&weights, &device)
+            .unwrap();
+        let input =
+            ::candle_core::Tensor::zeros((1, 1, 64, 64), ::candle_core::DType::F32, &device)
+                .unwrap();
+        let outputs = model.forward(&input).unwrap();
+        assert_eq!(outputs.prob.dims(), &[1, 1, 32, 32]);
+        assert_eq!(outputs.dist.dims(), &[1, 32, 32, 32]);
+    }
+
+    #[cfg(all(feature = "candle", feature = "hdf5"))]
+    #[test]
+    fn candle_2d_model_matches_python_fixture_when_available() {
+        let fixture_path = "tests/fixtures/2d_demo_inference.npz";
+        let weights_path = "stardist/models/examples/2D_demo/weights_best.h5";
+        if !std::path::Path::new(fixture_path).exists() {
+            return;
+        }
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+
+        let device = ::candle_core::Device::Cpu;
+        let config =
+            Config2D::from_json_file("assets/models/examples/2D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let fixture = crate::fixtures::load_stardist_2d_inference_fixture(fixture_path).unwrap();
+        let model = candle::StarDist2D::init(config, &device)
+            .load_keras_weights(&weights, &device)
+            .unwrap();
+        let input =
+            ::candle_core::Tensor::from_vec(fixture.input_nchw.values, (1, 1, 64, 64), &device)
+                .unwrap();
+        let outputs = model.forward(&input).unwrap();
+        let prob = outputs
+            .prob
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let dist = outputs
+            .dist
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(fixture.prob_nchw.shape, vec![1, 1, 32, 32]);
+        assert_eq!(fixture.dist_nchw.shape, vec![1, 32, 32, 32]);
+        for i in 0..prob.len() {
+            assert!(
+                (prob[i] - fixture.prob_nchw.values[i]).abs() < 1e-4,
+                "prob mismatch at {i}: rust={} python={}",
+                prob[i],
+                fixture.prob_nchw.values[i]
+            );
+        }
+        for i in 0..dist.len() {
+            assert!(
+                (dist[i] - fixture.dist_nchw.values[i]).abs() < 1e-3,
+                "dist mismatch at {i}: rust={} python={}",
+                dist[i],
+                fixture.dist_nchw.values[i]
+            );
+        }
+    }
+
+    #[cfg(all(feature = "candle", feature = "hdf5"))]
+    #[test]
+    fn candle_2d_model_matches_python_instances_fixture_when_available() {
+        let fixture_path = "tests/fixtures/2d_demo_instances.npz";
+        let weights_path = "stardist/models/examples/2D_demo/weights_best.h5";
+        if !std::path::Path::new(fixture_path).exists() {
+            return;
+        }
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+
+        let device = ::candle_core::Device::Cpu;
+        let config =
+            Config2D::from_json_file("assets/models/examples/2D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let fixture = crate::fixtures::load_stardist_2d_instances_fixture(fixture_path).unwrap();
+        let model = candle::StarDist2D::init(config.clone(), &device)
+            .load_keras_weights(&weights, &device)
+            .unwrap();
+        let input =
+            ::candle_core::Tensor::from_vec(fixture.input_nchw.values, (1, 1, 64, 64), &device)
+                .unwrap();
+        let outputs = model.forward(&input).unwrap();
+        let prob = outputs
+            .prob
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let dist_nchw = outputs
+            .dist
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut dist_yxc = vec![0.0f32; 32 * 32 * config.n_rays];
+        for ray in 0..config.n_rays {
+            for y in 0..32 {
+                for x in 0..32 {
+                    dist_yxc[(y * 32 + x) * config.n_rays + ray] =
+                        dist_nchw[(ray * 32 + y) * 32 + x];
+                }
+            }
+        }
+
+        let instances = StarDist2D::new(config)
+            ._instances_from_prediction(
+                [64, 64],
+                &prob,
+                [32, 32],
+                &dist_yxc,
+                None,
+                None,
+                None,
+                None,
+                true,
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+
+        let labels = instances.labels.unwrap();
+        assert_eq!(fixture.labels.shape, vec![64, 64]);
+        assert_eq!(
+            labels.iter().copied().collect::<Vec<_>>(),
+            fixture.labels.values
+        );
+        assert_eq!(fixture.points.shape, vec![instances.points.len(), 2]);
+        for (i, point) in instances.points.iter().enumerate() {
+            assert!(
+                (point[0] - fixture.points.values[i * 2]).abs() < 1e-4,
+                "point y mismatch at {i}: rust={} python={}",
+                point[0],
+                fixture.points.values[i * 2]
+            );
+            assert!(
+                (point[1] - fixture.points.values[i * 2 + 1]).abs() < 1e-4,
+                "point x mismatch at {i}: rust={} python={}",
+                point[1],
+                fixture.points.values[i * 2 + 1]
+            );
+        }
+        assert_eq!(instances.prob.len(), fixture.prob.values.len());
+        for i in 0..instances.prob.len() {
+            assert!(
+                (instances.prob[i] - fixture.prob.values[i]).abs() < 1e-4,
+                "instance prob mismatch at {i}: rust={} python={}",
+                instances.prob[i],
+                fixture.prob.values[i]
+            );
+        }
+        assert_eq!(fixture.coord.shape, instances.coord.shape());
+        for (i, value) in instances.coord.iter().enumerate() {
+            assert!(
+                (*value - fixture.coord.values[i]).abs() < 1e-3,
+                "coord mismatch at {i}: rust={} python={}",
+                *value,
+                fixture.coord.values[i]
+            );
+        }
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn candle_3d_model_loads_keras_weights_and_runs_forward() {
+        let weights_path = "stardist/models/examples/3D_demo/weights_best.h5";
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+        let device = ::candle_core::Device::Cpu;
+        let config =
+            crate::Config3D::from_json_file("assets/models/examples/3D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let model = candle::StarDist3D::init(config, &device)
+            .load_keras_weights(&weights, &device)
+            .unwrap();
+        let input =
+            ::candle_core::Tensor::zeros((1, 1, 8, 16, 16), ::candle_core::DType::F32, &device)
+                .unwrap();
+        let outputs = model.forward(&input).unwrap();
+        assert_eq!(outputs.prob.dims(), &[1, 1, 8, 8, 8]);
+        assert_eq!(outputs.dist.dims(), &[1, 96, 8, 8, 8]);
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn candle_cuda_conv3d_matches_cpu_small_case() {
+        let cuda = ::candle_core::Device::new_cuda(0).unwrap();
+        let cpu = ::candle_core::Device::Cpu;
+        assert_cuda_conv3d_matches_cpu(&cpu, &cuda, (1, 1, 2, 2, 2), (1, 1, 1, 1, 1), 0, 1);
+        assert_cuda_conv3d_matches_cpu(&cpu, &cuda, (1, 1, 3, 3, 3), (1, 1, 3, 3, 3), 1, 1);
+        assert_cuda_conv3d_matches_cpu(&cpu, &cuda, (1, 1, 5, 5, 5), (1, 1, 3, 3, 3), 0, 2);
+        assert_cuda_conv3d_matches_cpu(&cpu, &cuda, (2, 2, 3, 3, 3), (2, 2, 2, 2, 2), 0, 1);
+        assert_cuda_conv3d_matches_cpu(&cpu, &cuda, (1, 8, 4, 8, 8), (16, 8, 3, 3, 3), 1, 1);
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    fn assert_cuda_conv3d_matches_cpu(
+        cpu: &::candle_core::Device,
+        cuda: &::candle_core::Device,
+        input_shape: (usize, usize, usize, usize, usize),
+        kernel_shape: (usize, usize, usize, usize, usize),
+        padding: usize,
+        stride: usize,
+    ) {
+        let input_len =
+            input_shape.0 * input_shape.1 * input_shape.2 * input_shape.3 * input_shape.4;
+        let kernel_len =
+            kernel_shape.0 * kernel_shape.1 * kernel_shape.2 * kernel_shape.3 * kernel_shape.4;
+        let input = (0..input_len)
+            .map(|v| (v % 17) as f32 / 8. - 1.)
+            .collect::<Vec<_>>();
+        let kernel = (0..kernel_len)
+            .map(|v| (v % 11) as f32 / 5. - 1.)
+            .collect::<Vec<_>>();
+        let input_cpu = ::candle_core::Tensor::from_vec(input.clone(), input_shape, cpu).unwrap();
+        let kernel_cpu =
+            ::candle_core::Tensor::from_vec(kernel.clone(), kernel_shape, cpu).unwrap();
+        let input_cuda = ::candle_core::Tensor::from_vec(input, input_shape, cuda).unwrap();
+        let kernel_cuda = ::candle_core::Tensor::from_vec(kernel, kernel_shape, cuda).unwrap();
+        let expected = input_cpu
+            .conv3d(&kernel_cpu, padding, stride, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let actual = input_cuda
+            .conv3d(&kernel_cuda, padding, stride, 1, 1)
+            .unwrap()
+            .to_device(cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-4,
+            "max_abs={max_abs} input_shape={input_shape:?} kernel_shape={kernel_shape:?} padding={padding} stride={stride}"
+        );
+    }
+
+    #[cfg(all(feature = "candle-cuda", feature = "hdf5"))]
+    #[test]
+    fn candle_cuda_3d_model_matches_cpu_fixture_when_available() {
+        let fixture_path = "tests/fixtures/3d_demo_inference.npz";
+        let weights_path = "stardist/models/examples/3D_demo/weights_best.h5";
+        if !std::path::Path::new(fixture_path).exists() {
+            return;
+        }
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+
+        let cpu = ::candle_core::Device::Cpu;
+        let cuda = ::candle_core::Device::new_cuda(0).unwrap();
+        let config =
+            crate::Config3D::from_json_file("assets/models/examples/3D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let fixture = crate::fixtures::load_stardist_3d_inference_fixture(fixture_path).unwrap();
+        let cpu_model = candle::StarDist3D::init(config.clone(), &cpu)
+            .load_keras_weights(&weights, &cpu)
+            .unwrap();
+        let cuda_model = candle::StarDist3D::init(config, &cuda)
+            .load_keras_weights(&weights, &cuda)
+            .unwrap();
+        let input_cpu = ::candle_core::Tensor::from_vec(
+            fixture.input_ncdhw.values.clone(),
+            (1, 1, 8, 16, 16),
+            &cpu,
+        )
+        .unwrap();
+        let input_cuda =
+            ::candle_core::Tensor::from_vec(fixture.input_ncdhw.values, (1, 1, 8, 16, 16), &cuda)
+                .unwrap();
+        let cpu_outputs = cpu_model.forward(&input_cpu).unwrap();
+        let cuda_outputs = cuda_model.forward(&input_cuda).unwrap();
+        let cpu_prob = cpu_outputs
+            .prob
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda_prob = cuda_outputs
+            .prob
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_abs = cpu_prob
+            .iter()
+            .zip(cuda_prob.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 1e-3, "prob max_abs={max_abs}");
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn candle_cuda_conv3d_wrapper_anisotropic_matches_cpu() {
+        let cpu = ::candle_core::Device::Cpu;
+        let cuda = ::candle_core::Device::new_cuda(0).unwrap();
+        let input = (0..2 * 4 * 6 * 6)
+            .map(|v| (v % 19) as f32 / 9. - 1.)
+            .collect::<Vec<_>>();
+        let weight = (0..3 * 2 * 3 * 3 * 3)
+            .map(|v| (v % 13) as f32 / 6. - 1.)
+            .collect::<Vec<_>>();
+        let config = candle::CandleConv3dConfig {
+            padding: [1, 1, 1],
+            stride: [1, 2, 2],
+        };
+        let cpu_layer = candle::CandleConv3d {
+            weight: ::candle_core::Tensor::from_vec(weight.clone(), (3, 2, 3, 3, 3), &cpu).unwrap(),
+            bias: None,
+            config,
+        };
+        let cuda_layer = candle::CandleConv3d {
+            weight: ::candle_core::Tensor::from_vec(weight, (3, 2, 3, 3, 3), &cuda).unwrap(),
+            bias: None,
+            config,
+        };
+        let input_cpu =
+            ::candle_core::Tensor::from_vec(input.clone(), (1, 2, 4, 6, 6), &cpu).unwrap();
+        let input_cuda = ::candle_core::Tensor::from_vec(input, (1, 2, 4, 6, 6), &cuda).unwrap();
+        let expected = cpu_layer
+            .forward(&input_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let actual = cuda_layer
+            .forward(&input_cuda)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 1e-3, "wrapper anisotropic max_abs={max_abs}");
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn candle_cuda_conv2d_stride_padding_matches_cpu() {
+        let cpu = ::candle_core::Device::Cpu;
+        let cuda = ::candle_core::Device::new_cuda(0).unwrap();
+        let input = (0..2 * 6 * 6)
+            .map(|v| (v % 19) as f32 / 9. - 1.)
+            .collect::<Vec<_>>();
+        let weight = (0..3 * 2 * 3 * 3)
+            .map(|v| (v % 13) as f32 / 6. - 1.)
+            .collect::<Vec<_>>();
+        let input_cpu = ::candle_core::Tensor::from_vec(input.clone(), (1, 2, 6, 6), &cpu).unwrap();
+        let weight_cpu =
+            ::candle_core::Tensor::from_vec(weight.clone(), (3, 2, 3, 3), &cpu).unwrap();
+        let input_cuda = ::candle_core::Tensor::from_vec(input, (1, 2, 6, 6), &cuda).unwrap();
+        let weight_cuda = ::candle_core::Tensor::from_vec(weight, (3, 2, 3, 3), &cuda).unwrap();
+        let expected = input_cpu
+            .conv2d(&weight_cpu, 1, 2, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let actual = input_cuda
+            .conv2d(&weight_cuda, 1, 2, 1, 1)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs < 1e-3, "conv2d max_abs={max_abs}");
+    }
+
+    #[cfg(all(feature = "candle", feature = "hdf5"))]
+    #[test]
+    fn candle_3d_model_matches_python_fixture_when_available() {
+        let fixture_path = "tests/fixtures/3d_demo_inference.npz";
+        let weights_path = "stardist/models/examples/3D_demo/weights_best.h5";
+        if !std::path::Path::new(fixture_path).exists() {
+            return;
+        }
+        if !std::path::Path::new(weights_path).exists() {
+            return;
+        }
+
+        let device = ::candle_core::Device::Cpu;
+        let config =
+            crate::Config3D::from_json_file("assets/models/examples/3D_demo/config.json").unwrap();
+        let weights = crate::weights::load_keras_hdf5_weights(weights_path).unwrap();
+        let fixture = crate::fixtures::load_stardist_3d_inference_fixture(fixture_path).unwrap();
+        let model = candle::StarDist3D::init(config, &device)
+            .load_keras_weights(&weights, &device)
+            .unwrap();
+        let input =
+            ::candle_core::Tensor::from_vec(fixture.input_ncdhw.values, (1, 1, 8, 16, 16), &device)
+                .unwrap();
+        let outputs = model.forward(&input).unwrap();
+        let prob = outputs
+            .prob
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let dist = outputs
+            .dist
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(fixture.prob_ncdhw.shape, vec![1, 1, 8, 8, 8]);
+        assert_eq!(fixture.dist_ncdhw.shape, vec![1, 96, 8, 8, 8]);
+        for i in 0..prob.len() {
+            assert!(
+                (prob[i] - fixture.prob_ncdhw.values[i]).abs() < 1e-4,
+                "prob mismatch at {i}: rust={} python={}",
+                prob[i],
+                fixture.prob_ncdhw.values[i]
+            );
+        }
+        for i in 0..dist.len() {
+            assert!(
+                (dist[i] - fixture.dist_ncdhw.values[i]).abs() < 1e-3,
+                "dist mismatch at {i}: rust={} python={}",
+                dist[i],
+                fixture.dist_ncdhw.values[i]
+            );
+        }
+    }
+
     #[cfg(all(feature = "burn", feature = "hdf5"))]
     #[test]
     fn burn_3d_model_loads_keras_weights_and_runs_forward() {
@@ -10974,7 +13782,12 @@ mod tests {
         assert_eq!(fixture.labels.shape, vec![8, 16, 16]);
         assert_eq!(
             labels.iter().copied().collect::<Vec<_>>(),
-            fixture.labels.values
+            fixture
+                .labels
+                .values
+                .iter()
+                .map(|label| *label as i32)
+                .collect::<Vec<_>>()
         );
         assert_eq!(fixture.points.shape, vec![instances.points.len(), 3]);
         for (i, point) in instances.points.iter().enumerate() {

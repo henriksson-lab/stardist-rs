@@ -90,8 +90,8 @@ pub fn star_dist(
                 let st_rays = (2.0 * PI) / (n_rays as f32);
                 for k in 0..n_rays {
                     let phi = (k as f32) * st_rays;
-                    let dy = phi.cos();
-                    let dx = phi.sin();
+                    let dy = phi.sin();
+                    let dx = phi.cos();
                     let mut y = 0.0f32;
                     let mut x = 0.0f32;
                     loop {
@@ -602,6 +602,7 @@ pub fn dist_to_coord3d(
     Ok(coord)
 }
 
+#[inline]
 pub fn inside_halfspace(
     z: f32,
     y: f32,
@@ -630,6 +631,7 @@ pub fn inside_halfspace(
     det >= 0.0
 }
 
+#[inline]
 pub fn inside_tetrahedron(
     z: f32,
     y: f32,
@@ -653,6 +655,107 @@ pub fn inside_tetrahedron(
         && inside_halfspace(z, y, x, rz, ry, rx, az, ay, ax, cz, cy, cx)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TetrahedronPlanes {
+    halfspaces: [HalfspaceDet; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HalfspaceDet {
+    az: f32,
+    ay: f32,
+    ax: f32,
+    m00: f32,
+    m01: f32,
+    m02: f32,
+    m10: f32,
+    m11: f32,
+    m12: f32,
+}
+
+#[inline]
+fn precompute_halfspace_det(
+    az: f32,
+    ay: f32,
+    ax: f32,
+    bz: f32,
+    by: f32,
+    bx: f32,
+    cz: f32,
+    cy: f32,
+    cx: f32,
+) -> HalfspaceDet {
+    let m00 = bz - az;
+    let m01 = by - ay;
+    let m02 = bx - ax;
+    let m10 = cz - az;
+    let m11 = cy - ay;
+    let m12 = cx - ax;
+    HalfspaceDet {
+        az,
+        ay,
+        ax,
+        m00,
+        m01,
+        m02,
+        m10,
+        m11,
+        m12,
+    }
+}
+
+#[inline]
+fn point_in_precomputed_halfspace(z: f32, y: f32, x: f32, hs: HalfspaceDet) -> bool {
+    let m20 = z - hs.az;
+    let m21 = y - hs.ay;
+    let m22 = x - hs.ax;
+    let det = hs.m00 * (hs.m11 * m22 - m21 * hs.m12) - hs.m01 * (hs.m10 * m22 - hs.m12 * m20)
+        + hs.m02 * (hs.m10 * m21 - hs.m11 * m20);
+    det >= 0.0
+}
+
+pub(crate) fn precompute_tetrahedron_planes(
+    center: &[f32; 3],
+    polyverts: &[[f32; 3]],
+    faces: &[[usize; 3]],
+) -> Vec<TetrahedronPlanes> {
+    let mut tetrahedra = Vec::with_capacity(faces.len());
+    for face in faces {
+        let a = polyverts[face[0]];
+        let b = polyverts[face[1]];
+        let c = polyverts[face[2]];
+        let r = *center;
+        tetrahedra.push(TetrahedronPlanes {
+            halfspaces: [
+                precompute_halfspace_det(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]),
+                precompute_halfspace_det(r[0], r[1], r[2], b[0], b[1], b[2], a[0], a[1], a[2]),
+                precompute_halfspace_det(r[0], r[1], r[2], c[0], c[1], c[2], b[0], b[1], b[2]),
+                precompute_halfspace_det(r[0], r[1], r[2], a[0], a[1], a[2], c[0], c[1], c[2]),
+            ],
+        });
+    }
+    tetrahedra
+}
+
+#[inline]
+fn inside_precomputed_tetrahedron(z: f32, y: f32, x: f32, tetra: &TetrahedronPlanes) -> bool {
+    point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[0])
+        && point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[1])
+        && point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[2])
+        && point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[3])
+}
+
+#[inline]
+fn inside_precomputed_polyhedron(z: f32, y: f32, x: f32, tetrahedra: &[TetrahedronPlanes]) -> bool {
+    for tetra in tetrahedra {
+        if inside_precomputed_tetrahedron(z, y, x, tetra) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
 pub fn inside_polyhedron(
     z: f32,
     y: f32,
@@ -1262,16 +1365,15 @@ pub fn render_polyhedron(
         return Err(GeometryError::RayCountMismatch);
     }
     let mut rendered = vec![false; nz * ny * nx];
+    let tetrahedra = precompute_tetrahedron_planes(center, polyverts, faces);
     for z in 0..nz {
         for y in 0..ny {
             for x in 0..nx {
-                rendered[x + y * nx + z * nx * ny] = inside_polyhedron(
+                rendered[x + y * nx + z * nx * ny] = inside_precomputed_polyhedron(
                     z as f32 + bbox[0] as f32,
                     y as f32 + bbox[2] as f32,
                     x as f32 + bbox[4] as f32,
-                    center,
-                    polyverts,
-                    faces,
+                    &tetrahedra,
                 );
             }
         }
@@ -1300,6 +1402,27 @@ pub fn overlap_render_polyhedron(
     {
         return Err(GeometryError::RayCountMismatch);
     }
+    let tetrahedra = precompute_tetrahedron_planes(center, polyverts, faces);
+    Ok(overlap_render_polyhedron_precomputed(
+        bbox,
+        &tetrahedra,
+        rendered,
+        nz,
+        ny,
+        nx,
+        overlap_maximal,
+    ))
+}
+
+pub(crate) fn overlap_render_polyhedron_precomputed(
+    bbox: &[isize; 6],
+    tetrahedra: &[TetrahedronPlanes],
+    rendered: &[bool],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    overlap_maximal: f32,
+) -> usize {
     let mut res = 0usize;
     for z in 0..nz {
         for y in 0..ny {
@@ -1308,17 +1431,17 @@ pub fn overlap_render_polyhedron(
                 let py = y as f32 + bbox[2] as f32;
                 let px = x as f32 + bbox[4] as f32;
                 if rendered[x + y * nx + z * nx * ny]
-                    && inside_polyhedron(pz, py, px, center, polyverts, faces)
+                    && inside_precomputed_polyhedron(pz, py, px, tetrahedra)
                 {
                     res += 1;
                 }
                 if (res as f32) > overlap_maximal {
-                    return Ok(res);
+                    return res;
                 }
             }
         }
     }
-    Ok(res)
+    res
 }
 
 pub fn overlap_render_polyhedron_kernel(
@@ -1463,6 +1586,7 @@ pub fn halfspaces_kernel(polyverts: &[[f32; 3]], faces: &[[usize; 3]]) -> Vec<[f
     halfspaces
 }
 
+#[inline]
 pub fn point_in_halfspaces(z: f32, y: f32, x: f32, halfspaces: &[[f64; 4]]) -> bool {
     for hs in halfspaces {
         if hs[0] * z as f64 + hs[1] * y as f64 + hs[2] * x as f64 + hs[3] > 0.0 {
@@ -1784,8 +1908,8 @@ pub fn relabel_image_stardist3d(
     grid: [usize; 3],
     verbose: bool,
     mode: PolyhedronRenderMode,
-    overlap_label: Option<u32>,
-) -> Result<Array3<u32>, GeometryError> {
+    overlap_label: Option<i32>,
+) -> Result<Array3<i32>, GeometryError> {
     let _ = verbose;
     if lbl.len() != shape[0] * shape[1] * shape[2] {
         return Err(GeometryError::ShapeMismatch);
@@ -1816,7 +1940,7 @@ pub fn relabel_image_stardist3d(
 
     let n_rays = rays.vertices.len();
     let mut points = Vec::<[f32; 3]>::new();
-    let mut labs = Vec::<u32>::new();
+    let mut labs = Vec::<i32>::new();
     let mut dist = Vec::<f32>::new();
     for label in 1..=max_label as usize {
         if count[label] == 0 {
@@ -1826,7 +1950,7 @@ pub fn relabel_image_stardist3d(
         let y = sum_y[label] / count[label];
         let x = sum_x[label] / count[label];
         points.push([z as f32, y as f32, x as f32]);
-        labs.push(label as u32);
+        labs.push(label as i32);
         for n in 0..n_rays {
             dist.push(dist_all[[z, y, x, n]].max(1.0e-3));
         }
@@ -1932,12 +2056,12 @@ pub fn polyhedron_to_label(
     shape: [usize; 3],
     prob: Option<&[f32]>,
     thr: f32,
-    labels: Option<&[u32]>,
+    labels: Option<&[i32]>,
     mode: PolyhedronRenderMode,
-    overlap_label: Option<u32>,
-) -> Result<Array3<u32>, GeometryError> {
+    overlap_label: Option<i32>,
+) -> Result<Array3<i32>, GeometryError> {
     if points.is_empty() {
-        return Ok(Array3::<u32>::zeros((shape[0], shape[1], shape[2])));
+        return Ok(Array3::<i32>::zeros((shape[0], shape[1], shape[2])));
     }
     let n_rays = rays.vertices.len();
     if n_rays == 0 || dist.len() != points.len() * n_rays {
@@ -1972,7 +2096,7 @@ pub fn polyhedron_to_label(
         }
     }
     if ind.is_empty() {
-        return Ok(Array3::<u32>::zeros((shape[0], shape[1], shape[2])));
+        return Ok(Array3::<i32>::zeros((shape[0], shape[1], shape[2])));
     }
 
     ind.sort_by(|&a, &b| {
@@ -1983,15 +2107,23 @@ pub fn polyhedron_to_label(
             .then_with(|| a.cmp(&b))
     });
 
-    let mut result = Array3::<u32>::zeros((shape[0], shape[1], shape[2]));
+    let mut result = Array3::<i32>::zeros((shape[0], shape[1], shape[2]));
     for i in ind {
         let curr_dist = &dist[i * n_rays..(i + 1) * n_rays];
         let curr_center = points[i];
-        let label = labels.map(|labels| labels[i]).unwrap_or((i + 1) as u32);
+        let label = labels.map(|labels| labels[i]).unwrap_or((i + 1) as i32);
         let polyverts = polyhedron_polyverts(curr_dist, &curr_center, &rays.vertices)?;
         let bbox = polyhedron_bbox(curr_dist, &curr_center, &rays.vertices)?;
         let hs_convex = halfspaces_convex(&polyverts);
         let hs_kernel = halfspaces_kernel(&polyverts, &rays.faces);
+        let tetrahedra = match mode {
+            PolyhedronRenderMode::Full | PolyhedronRenderMode::Debug => {
+                precompute_tetrahedron_planes(&curr_center, &polyverts, &rays.faces)
+            }
+            PolyhedronRenderMode::Kernel
+            | PolyhedronRenderMode::Hull
+            | PolyhedronRenderMode::Bbox => Vec::new(),
+        };
 
         let z0 = bbox[0].max(0) as usize;
         let z1 = bbox[1].min(shape[0].saturating_sub(1) as isize);
@@ -2011,13 +2143,11 @@ pub fn polyhedron_to_label(
                         PolyhedronRenderMode::Full => {
                             point_in_halfspaces(z as f32, y as f32, x as f32, &hs_kernel)
                                 || (point_in_halfspaces(z as f32, y as f32, x as f32, &hs_convex)
-                                    && inside_polyhedron(
+                                    && inside_precomputed_polyhedron(
                                         z as f32,
                                         y as f32,
                                         x as f32,
-                                        &curr_center,
-                                        &polyverts,
-                                        &rays.faces,
+                                        &tetrahedra,
                                     ))
                         }
                         PolyhedronRenderMode::Kernel => {
@@ -2034,13 +2164,11 @@ pub fn polyhedron_to_label(
                                 &curr_center,
                                 &polyverts,
                                 &rays.faces,
-                            ) && !inside_polyhedron(
+                            ) && !inside_precomputed_polyhedron(
                                 z as f32,
                                 y as f32,
                                 x as f32,
-                                &curr_center,
-                                &polyverts,
-                                &rays.faces,
+                                &tetrahedra,
                             )
                         }
                     };

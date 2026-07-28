@@ -1,10 +1,12 @@
+use std::sync::OnceLock;
+
 use crate::Rays;
 use crate::geometry::{
     bounding_radius_inner_gravity, bounding_radius_inner_isotropic, bounding_radius_outer,
     bounding_radius_outer_gravity, bounding_radius_outer_isotropic, calculate_poly_offset_gravity,
     intersect_bbox, intersect_sphere_gravity, intersect_sphere_isotropic,
-    overlap_render_polyhedron, polyhedron_bbox, polyhedron_polyverts, polyhedron_volume,
-    qhull_overlap_convex_hulls, qhull_overlap_kernel, render_polyhedron,
+    overlap_render_polyhedron_precomputed, polyhedron_bbox, polyhedron_polyverts,
+    polyhedron_volume, precompute_tetrahedron_planes, render_polyhedron,
 };
 use crate::utils::{_normalize_grid, GridError};
 
@@ -599,11 +601,20 @@ pub fn non_maximum_suppression_3d_inds(
     let mut bbox = vec![[0isize; 6]; n_polys];
     let mut suppressed = vec![false; n_polys];
     let mut anisotropy = [0.0f32; 3];
+    let mut polyverts_cache: Vec<Vec<[f32; 3]>> = Vec::with_capacity(n_polys);
+    let mut tetrahedra = Vec::with_capacity(n_polys);
 
     for i in 0..n_polys {
         let curr_dist = &dist[i * n_rays..(i + 1) * n_rays];
         volumes[i] = polyhedron_volume(curr_dist, &rays.vertices, &rays.faces)?;
         bbox[i] = polyhedron_bbox(curr_dist, &points[i], &rays.vertices)?;
+        let curr_polyverts = polyhedron_polyverts(curr_dist, &points[i], &rays.vertices)?;
+        tetrahedra.push(precompute_tetrahedron_planes(
+            &points[i],
+            &curr_polyverts,
+            &rays.faces,
+        ));
+        polyverts_cache.push(curr_polyverts);
         anisotropy[0] += (bbox[i][1] - bbox[i][0]) as f32 / n_polys as f32;
         anisotropy[1] += (bbox[i][3] - bbox[i][2]) as f32 / n_polys as f32;
         anisotropy[2] += (bbox[i][5] - bbox[i][4]) as f32 / n_polys as f32;
@@ -648,133 +659,145 @@ pub fn non_maximum_suppression_3d_inds(
         let nz = (bbox[i][1] - bbox[i][0] + 1).max(0) as usize;
         let ny = (bbox[i][3] - bbox[i][2] + 1).max(0) as usize;
         let nx = (bbox[i][5] - bbox[i][4] + 1).max(0) as usize;
-        let curr_polyverts = polyhedron_polyverts(curr_dist, &points[i], &rays.vertices)?;
-        let mut curr_rendered: Option<Vec<bool>> = None;
+        let curr_polyverts = &polyverts_cache[i];
+        let curr_rendered = OnceLock::new();
+        let j_start = i + 1;
+        let remaining = n_polys.saturating_sub(j_start);
+        if remaining == 0 {
+            continue;
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(remaining);
 
-        for j in i + 1..n_polys {
-            if suppressed[j] {
-                continue;
-            }
-            if _use_kdtree {
-                let dz = points[i][0] - points[j][0];
-                let dy = points[i][1] - points[j][1];
-                let dx = points[i][2] - points[j][2];
-                if dz * dz + dy * dy + dx * dx > (max_dist + radius_outer[i]).powi(2) {
-                    continue;
-                }
+        let suppressed_this_round = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            let suppressed_ref = &suppressed;
+            let volumes_ref = &volumes;
+            let radius_outer_ref = &radius_outer;
+            let radius_inner_isotropic_ref = &radius_inner_isotropic;
+            let radius_outer_isotropic_ref = &radius_outer_isotropic;
+            let radius_inner_gravity_ref = &radius_inner_gravity;
+            let radius_outer_gravity_ref = &radius_outer_gravity;
+            let poly_offset_gravity_ref = &poly_offset_gravity;
+            let bbox_ref = &bbox;
+            let tetrahedra_ref = &tetrahedra;
+            let curr_rendered_ref = &curr_rendered;
+            let points_ref = points;
+            let faces_ref = &rays.faces;
+            for worker in 0..workers {
+                let start = j_start + worker * remaining / workers;
+                let end = j_start + (worker + 1) * remaining / workers;
+                handles.push(scope.spawn(move || {
+                    let mut local_suppressed = Vec::new();
+                    for j in start..end {
+                        if suppressed_ref[j] {
+                            continue;
+                        }
+                        if _use_kdtree {
+                            let dz = points_ref[i][0] - points_ref[j][0];
+                            let dy = points_ref[i][1] - points_ref[j][1];
+                            let dx = points_ref[i][2] - points_ref[j][2];
+                            if dz * dz + dy * dy + dx * dx
+                                > (max_dist + radius_outer_ref[i]).powi(2)
+                            {
+                                continue;
+                            }
+                        }
+
+                        let a_min = volumes_ref[i].min(volumes_ref[j]);
+                        let a_sphere_outer = if _use_gravity {
+                            intersect_sphere_gravity(
+                                radius_outer_gravity_ref[i],
+                                &points_ref[i],
+                                &poly_offset_gravity_ref[i],
+                                radius_outer_gravity_ref[j],
+                                &points_ref[j],
+                                &poly_offset_gravity_ref[j],
+                                &anisotropy,
+                            )
+                        } else {
+                            intersect_sphere_isotropic(
+                                radius_outer_isotropic_ref[i],
+                                &points_ref[i],
+                                radius_outer_isotropic_ref[j],
+                                &points_ref[j],
+                                &anisotropy,
+                            )
+                        };
+                        let mut a_inter =
+                            a_sphere_outer.min(intersect_bbox(&bbox_ref[i], &bbox_ref[j]));
+                        let mut iou = 1.0f32.min(a_inter / (a_min + 1.0e-10));
+                        if use_bbox && (a_inter < 1.0e-10 || iou <= thresh) {
+                            continue;
+                        }
+
+                        a_inter = if _use_gravity {
+                            intersect_sphere_gravity(
+                                radius_inner_gravity_ref[i],
+                                &points_ref[i],
+                                &poly_offset_gravity_ref[i],
+                                radius_inner_gravity_ref[j],
+                                &points_ref[j],
+                                &poly_offset_gravity_ref[j],
+                                &anisotropy,
+                            )
+                        } else {
+                            intersect_sphere_isotropic(
+                                radius_inner_isotropic_ref[i],
+                                &points_ref[i],
+                                radius_inner_isotropic_ref[j],
+                                &points_ref[j],
+                                &anisotropy,
+                            )
+                        };
+                        iou = 0.0f32.max(a_inter / (a_min + 1.0e-10));
+                        if iou > thresh {
+                            local_suppressed.push(j);
+                            continue;
+                        }
+
+                        let rendered = curr_rendered_ref.get_or_init(|| {
+                            render_polyhedron(
+                                curr_dist,
+                                &points_ref[i],
+                                &bbox_ref[i],
+                                curr_polyverts,
+                                faces_ref,
+                                nz,
+                                ny,
+                                nx,
+                            )
+                            .expect("validated polyhedron should render")
+                        });
+                        let a_inter_render = overlap_render_polyhedron_precomputed(
+                            &bbox_ref[i],
+                            &tetrahedra_ref[j],
+                            rendered,
+                            nz,
+                            ny,
+                            nx,
+                            (a_min + 1.0e-10) * thresh,
+                        ) as f32;
+                        iou = a_inter_render / (a_min + 1.0e-10);
+                        if iou > thresh {
+                            local_suppressed.push(j);
+                        }
+                    }
+                    local_suppressed
+                }));
             }
 
-            let a_min = volumes[i].min(volumes[j]);
-            let a_sphere_outer = if _use_gravity {
-                intersect_sphere_gravity(
-                    radius_outer_gravity[i],
-                    &points[i],
-                    &poly_offset_gravity[i],
-                    radius_outer_gravity[j],
-                    &points[j],
-                    &poly_offset_gravity[j],
-                    &anisotropy,
-                )
-            } else {
-                intersect_sphere_isotropic(
-                    radius_outer_isotropic[i],
-                    &points[i],
-                    radius_outer_isotropic[j],
-                    &points[j],
-                    &anisotropy,
-                )
-            };
-            let mut a_inter = a_sphere_outer.min(intersect_bbox(&bbox[i], &bbox[j]));
-            let mut iou = 1.0f32.min(a_inter / (a_min + 1.0e-10));
-            if use_bbox && (a_inter < 1.0e-10 || iou <= thresh) {
-                continue;
+            let mut merged = Vec::new();
+            for handle in handles {
+                merged.extend(handle.join().expect("nms worker panicked"));
             }
+            merged
+        });
 
-            a_inter = if _use_gravity {
-                intersect_sphere_gravity(
-                    radius_inner_gravity[i],
-                    &points[i],
-                    &poly_offset_gravity[i],
-                    radius_inner_gravity[j],
-                    &points[j],
-                    &poly_offset_gravity[j],
-                    &anisotropy,
-                )
-            } else {
-                intersect_sphere_isotropic(
-                    radius_inner_isotropic[i],
-                    &points[i],
-                    radius_inner_isotropic[j],
-                    &points[j],
-                    &anisotropy,
-                )
-            };
-            iou = 0.0f32.max(a_inter / (a_min + 1.0e-10));
-            if iou > thresh {
-                suppressed[j] = true;
-                continue;
-            }
-
-            let polyverts = polyhedron_polyverts(
-                &dist[j * n_rays..(j + 1) * n_rays],
-                &points[j],
-                &rays.vertices,
-            )?;
-
-            let a_inter_kernel = qhull_overlap_kernel(
-                &curr_polyverts,
-                &points[i],
-                &polyverts,
-                &points[j],
-                &rays.faces,
-                1,
-            );
-            iou = a_inter_kernel / (a_min + 1.0e-10);
-            if iou > thresh {
-                suppressed[j] = true;
-                continue;
-            }
-
-            let a_inter_convex = qhull_overlap_convex_hulls(
-                &curr_polyverts,
-                &points[i],
-                &polyverts,
-                &points[j],
-                &rays.faces,
-            );
-            iou = a_inter_convex / (a_min + 1.0e-10);
-            if iou <= thresh {
-                continue;
-            }
-
-            if curr_rendered.is_none() {
-                curr_rendered = Some(render_polyhedron(
-                    curr_dist,
-                    &points[i],
-                    &bbox[i],
-                    &curr_polyverts,
-                    &rays.faces,
-                    nz,
-                    ny,
-                    nx,
-                )?);
-            }
-            let a_inter_render = overlap_render_polyhedron(
-                &dist[j * n_rays..(j + 1) * n_rays],
-                &points[j],
-                &bbox[i],
-                &polyverts,
-                &rays.faces,
-                curr_rendered.as_ref().unwrap(),
-                nz,
-                ny,
-                nx,
-                (a_min + 1.0e-10) * thresh,
-            )? as f32;
-            iou = a_inter_render / (a_min + 1.0e-10);
-            if iou > thresh {
-                suppressed[j] = true;
-            }
+        for j in suppressed_this_round {
+            suppressed[j] = true;
         }
     }
 

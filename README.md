@@ -2,6 +2,7 @@
 
 This is a Rust translation of [StarDist](https://github.com/stardist/stardist) - Object Detection with Star-convex Shapes
 
+* 2026-07-27: Work on getting proper speed. 2d is ok with GPU, and 3d CUDA now has exact-label parity with postprocessing close to the original implementation.
 * 2026-07-26: Initial translation
 
 Translated from upstream StarDist commit `e80c6de700693bc228ed3c9ba1dc19c3785667ee`.
@@ -72,12 +73,20 @@ information about how we approach translation.
 
 CLI-style prediction adapters are kept behind the optional `cli` feature.
 
-Enable the `burn` feature for the native Burn model implementation. The default feature set includes `hdf5`, which is needed for loading Keras `.h5` weights.
+Enable the `burn` or `candle` feature for native model implementations. The default feature set includes `hdf5`, which is needed for loading Keras `.h5` weights.
 
 ```toml
 [dependencies]
 stardist-rs = { version = "0.1", features = ["burn", "hdf5"] }
 burn = { version = "0.21", default-features = false, features = ["std", "train", "autodiff", "flex"] }
+```
+
+For Candle 2D inference instead:
+
+```toml
+[dependencies]
+stardist-rs = { version = "0.1", features = ["candle", "hdf5"] }
+candle-core = "0.9"
 ```
 
 Runnable examples are available under `examples/`:
@@ -87,6 +96,66 @@ cargo run --example config_thresholds
 cargo run --example sample_data
 cargo run --example bioimageio_helpers
 ```
+
+### Compare against original Python StarDist
+
+For local speed, peak-RSS, and parity checks on the bundled 2D real TIFF image,
+generate an original Python StarDist artifact first, then run the Rust examples
+against the same normalized tensor:
+
+```bash
+python3 scripts/bench_original_real_data.py 2d --out .tmp/bench_original_real_2d.npz
+cargo run --release --features burn --example bench_burn_real_data -- 2d .tmp/bench_original_real_2d.npz
+cargo run --release --features candle,hdf5 --example bench_candle_real_data -- 2d .tmp/bench_original_real_2d.npz cpu
+```
+
+To run and collect the 2D benchmark set in one JSON summary:
+
+```bash
+python3 scripts/bench_real_data.py --dimensions 2d --out .tmp/bench_real_data_summary.json
+python3 scripts/bench_real_data.py --dimensions 2d --candle-cuda
+python3 scripts/bench_real_data.py --dimensions 2d --candle-cuda --cuda-home /usr/local/cuda-12.8 --cuda-compute-cap 75
+```
+
+The Python script uses the untracked upstream checkout under `stardist/` and
+writes timing/RSS JSON next to the NPZ. The Rust example loads the same input
+and Python outputs, then reports Burn/Candle timing, peak RSS, and max/mean
+absolute differences for raw predictions plus instance outputs. The benchmark
+runner keeps the original Python baseline on CPU by default to avoid accidental
+TensorFlow GPU failures; pass `--python-gpu` to benchmark original StarDist on
+TensorFlow GPU. The
+`--candle-cuda` runner option preflights for `nvcc`, then builds with
+`--features candle-cuda,hdf5` only when the CUDA toolkit is available. Pass
+`--cuda-home` to select a specific toolkit instead of the first `nvcc` on
+`PATH`; pass `--cuda-compute-cap` if the benchmark environment cannot query the
+driver directly. This checkout patches `candle-kernels` locally to skip unused
+MoE WMMA CUDA kernels; StarDist uses F32 inference and does not need those BF16
+MoE kernels. That lets the Candle CUDA benchmark run on the local Quadro RTX
+5000 sm75/Turing GPU.
+
+Representative local 2D results on `assets/data/images/img2d.tif`:
+
+| Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Burn CPU | 0.592 s | 1.502 s | 2.54x slower | 0.283 s | 1.484 s | 5.25x slower | 2.147 s | 0.234 s | 9.2x faster | 1214.3 MiB | 283.3 MiB | 4.3x lower | labels exact; raw max diff `2.29e-5` |
+| Candle CPU | 0.592 s | 2.568 s | 4.34x slower | 0.283 s | 2.383 s | 8.43x slower | 2.147 s | 0.185 s | 11.6x faster | 1214.3 MiB | 286.8 MiB | 4.2x lower | labels exact; raw max diff `2.29e-5` |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.592 s | 0.050 s | 11.9x faster | 0.283 s | 0.111 s | 2.6x faster | 2.147 s | 0.075 s | 28.5x faster | 1214.3 MiB | 378.0 MiB | 3.2x lower | labels exact; raw max diff `4.58e-5` |
+
+These timings include TensorFlow/Python and Burn/Flex CPU behavior on this
+machine. Treat them as translation diagnostics, not portable performance
+claims.
+
+Representative local 3D results on `assets/data/images/img3d.tif`:
+
+| Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.303 s | 0.096 s | 3.1x faster | 0.369 s | 0.174 s | 2.1x faster | 0.629 s | 0.857 s | 1.4x slower | 1369.7 MiB | 374.0 MiB | 3.7x lower | labels exact; raw prob max diff `7.15e-7`; raw dist max diff `1.34e-5` |
+
+The 3D CUDA row uses Candle's non-cuDNN CUDA Conv3d path on CUDA 12.8. The raw
+network path has parity. The Rust NMS path skips the local brute-force
+halfspace-intersection filter and goes directly from the cheap bounds to exact
+rendered overlap, because the original implementation uses Qhull for that
+filter.
 
 ### Run the bundled 2D demo model with Burn
 
@@ -129,6 +198,35 @@ let model = stardist_rs::model::burn::StarDist3D::<B>::init(config, &device)
     .load_keras_weights(&weights, &device)?;
 let image = burn::tensor::Tensor::<B, 5>::zeros([1, 1, 8, 16, 16], &device);
 let outputs = model.forward(image);
+```
+
+### Run the bundled 2D demo model with Candle
+
+Candle covers the 2D U-Net inference path. Use the `candle-cuda` or
+`candle-metal` crate feature for local GPU builds; the Rust API stays the same
+except for the selected `candle_core::Device`.
+
+```rust
+use candle_core::{Device, Tensor};
+use stardist_rs::{Config2D, model::candle as stardist_candle};
+use stardist_rs::weights::load_keras_hdf5_weights;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device = Device::Cpu;
+    let config = Config2D::from_json_file("assets/models/examples/2D_demo/config.json")?;
+    let weights = load_keras_hdf5_weights("path/to/weights_best.h5")?;
+
+    let model = stardist_candle::StarDist2D::try_init(config, &device)?
+        .load_keras_weights(&weights, &device)?;
+
+    // Replace this with normalized image pixels in NCHW order.
+    let image = Tensor::zeros((1, 1, 64, 64), candle_core::DType::F32, &device)?;
+    let outputs = model.forward(&image)?;
+
+    assert_eq!(outputs.prob.dims(), &[1, 1, 32, 32]);
+    assert_eq!(outputs.dist.dims(), &[1, 32, 32, 32]);
+    Ok(())
+}
 ```
 
 ### Postprocess predictions without Burn

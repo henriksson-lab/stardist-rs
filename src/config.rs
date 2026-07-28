@@ -49,7 +49,7 @@ pub struct Config2D {
     pub train_batch_size: usize,
     pub train_n_val_patches: Option<usize>,
     pub train_tensorboard: bool,
-    pub train_reduce_lr: TrainReduceLr,
+    pub train_reduce_lr: Option<TrainReduceLr>,
     pub use_gpu: bool,
 }
 
@@ -126,7 +126,7 @@ pub struct Config3D {
     pub train_batch_size: usize,
     pub train_n_val_patches: Option<usize>,
     pub train_tensorboard: bool,
-    pub train_reduce_lr: TrainReduceLr,
+    pub train_reduce_lr: Option<TrainReduceLr>,
     pub use_gpu: bool,
 }
 
