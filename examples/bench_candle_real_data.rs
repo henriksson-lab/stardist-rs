@@ -13,6 +13,7 @@ mod bench {
     use ndarray_npy::NpzReader;
     use stardist_rs::{
         PolyhedronRenderMode, StarDist2D, StarDist3D, StarDistDirectPrediction,
+        non_maximum_suppression_3d_sparse, polyhedron_to_label, rays_from_json, relabel_sequential,
         weights::load_keras_hdf5_weights,
     };
 
@@ -206,6 +207,48 @@ mod bench {
             |x, x_shape, axes| predict_direct_3d(&model, &config, &device, x, x_shape, axes),
         )?;
         let predict_sparse_seconds = started.elapsed().as_secs_f64();
+        if env::var_os("STARDIST_BENCH_SPLIT").is_some() {
+            let rays = rays_from_json(&config.rays_json)?;
+            let started = Instant::now();
+            let nms = non_maximum_suppression_3d_sparse(
+                &sparse.dist,
+                &sparse.prob,
+                &sparse.points,
+                &rays,
+                None,
+                stardist.thresholds.nms,
+                true,
+                true,
+                false,
+            )?;
+            let nms_seconds = started.elapsed().as_secs_f64();
+
+            let started = Instant::now();
+            let raw_labels = polyhedron_to_label(
+                &nms.dist,
+                &nms.points,
+                &rays,
+                [input_shape[2], input_shape[3], input_shape[4]],
+                Some(&nms.prob),
+                f32::NEG_INFINITY,
+                None,
+                PolyhedronRenderMode::Full,
+                None,
+            )?;
+            let label_seconds = started.elapsed().as_secs_f64();
+
+            let started = Instant::now();
+            let relabel_input = raw_labels
+                .iter()
+                .map(|label| *label as u32)
+                .collect::<Vec<_>>();
+            let _relabeled = relabel_sequential(&relabel_input, 1)?;
+            let relabel_seconds = started.elapsed().as_secs_f64();
+            eprintln!(
+                "3d postprocess split: nms={nms_seconds:.6}s labels={label_seconds:.6}s relabel={relabel_seconds:.6}s kept={}",
+                nms.points.len()
+            );
+        }
         let started = Instant::now();
         let instances = stardist._instances_from_prediction(
             [input_shape[2], input_shape[3], input_shape[4]],

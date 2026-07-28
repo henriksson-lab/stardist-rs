@@ -2739,10 +2739,23 @@ impl StarDist2D {
                 dist_strides[i] = dist_strides[i + 1] * dist_shape_resized[i + 1];
             }
         }
-        let mut prob = Vec::<f32>::with_capacity(spatial_shape.iter().product::<usize>());
-        let mut dist = Vec::<f32>::with_capacity(prob.capacity() * self.config.n_rays);
+        let spatial_len = spatial_shape.iter().product::<usize>();
+        let border = [[b, b], [b, b]];
+        let interior_h = spatial_shape[0].saturating_sub(border[0][0] + border[0][1]);
+        let interior_w = spatial_shape[1].saturating_sub(border[1][0] + border[1][1]);
+        let expected_sparse = (interior_h * interior_w / 16).max(16);
+        let mut proba = Vec::<f32>::with_capacity(expected_sparse);
+        let mut dista = Vec::<f32>::with_capacity(expected_sparse * self.config.n_rays);
+        let mut pointsa = Vec::<[f32; 2]>::with_capacity(expected_sparse);
+        let mut kept_indices = Vec::<usize>::with_capacity(expected_sparse);
         for y in 0..spatial_shape[0] {
+            if y < border[0][0] || y >= spatial_shape[0].saturating_sub(border[0][1]) {
+                continue;
+            }
             for x in 0..spatial_shape[1] {
+                if x < border[1][0] || x >= spatial_shape[1].saturating_sub(border[1][1]) {
+                    continue;
+                }
                 let mut prob_index = 0usize;
                 let mut dist_base = 0usize;
                 let mut spatial_i = 0usize;
@@ -2757,37 +2770,25 @@ impl StarDist2D {
                     prob_index += coord * out_strides[axis_i];
                     dist_base += coord * dist_strides[axis_i];
                 }
-                prob.push(prob_resized[prob_index]);
+                let prob_value = prob_resized[prob_index];
+                if prob_value <= prob_thresh {
+                    continue;
+                }
+                let flat_index = y * spatial_shape[1] + x;
+                if flat_index >= spatial_len {
+                    return Err(StarDistPredictError::OutputShapeMismatch);
+                }
+                proba.push(prob_value);
                 for ray in 0..self.config.n_rays {
                     let mut index = dist_base;
                     index += ray * dist_strides[setup.channel];
-                    dist.push(dist_resized[index].max(1e-3));
+                    dista.push(dist_resized[index].max(1e-3));
                 }
-            }
-        }
-
-        let mask = crate::nms::_ind_prob_thresh(
-            &prob,
-            &spatial_shape,
-            prob_thresh,
-            Some(&[[b, b], [b, b]]),
-        )?;
-        let mut proba = Vec::<f32>::new();
-        let mut dista = Vec::<f32>::new();
-        let mut pointsa = Vec::<[f32; 2]>::new();
-        let mut kept_indices = Vec::<usize>::new();
-        for (i, keep) in mask.iter().enumerate() {
-            if *keep {
-                let y = i / spatial_shape[1];
-                let x = i % spatial_shape[1];
-                proba.push(prob[i]);
-                dista
-                    .extend_from_slice(&dist[i * self.config.n_rays..(i + 1) * self.config.n_rays]);
                 pointsa.push([
                     (y * self.config.grid[0]) as f32,
                     (x * self.config.grid[1]) as f32,
                 ]);
-                kept_indices.push(i);
+                kept_indices.push(flat_index);
             }
         }
 

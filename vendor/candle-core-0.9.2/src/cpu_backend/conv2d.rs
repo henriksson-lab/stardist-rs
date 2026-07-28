@@ -90,24 +90,76 @@ fn conv2d_1x1<T: WithDType + num_traits::Num + Copy + 'static>(
     };
     let k_layout = Layout::contiguous((p.c_out, p.c_in));
 
+    if p.b_size == 1 {
+        let inp_reshaped;
+        let inp_values;
+        let inp_layout = if inp_s0 == p.c_in * spatial_size
+            && inp_s1 == spatial_size
+            && inp_s2 == p.i_w
+            && inp_s3 == 1
+        {
+            inp_values = inp;
+            Layout::contiguous((p.c_in, spatial_size))
+        } else {
+            // Reshape input to [c_in, h*w].
+            inp_reshaped = {
+                let mut inp_reshaped = Vec::with_capacity(p.c_in * spatial_size);
+                for c_in_idx in 0..p.c_in {
+                    for h_idx in 0..p.i_h {
+                        for w_idx in 0..p.i_w {
+                            let inp_idx =
+                                c_in_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
+                            inp_reshaped.push(inp[inp_idx]);
+                        }
+                    }
+                }
+                inp_reshaped
+            };
+            inp_values = &inp_reshaped;
+            Layout::contiguous((p.c_in, spatial_size))
+        };
+
+        // The [c_out, h*w] GEMM result is already contiguous in the same memory
+        // order as [1, c_out, h, w], so batch-1 inference can return it directly.
+        let matmul = MatMul((1, p.c_out, spatial_size, p.c_in));
+        return matmul.f(&k_reshaped, &k_layout, inp_values, &inp_layout);
+    }
+
     // Process each batch
     (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
-        // Reshape input to [c_in, h*w] for this batch
-        let mut inp_reshaped = Vec::with_capacity(p.c_in * spatial_size);
-        for c_in_idx in 0..p.c_in {
-            for h_idx in 0..p.i_h {
-                for w_idx in 0..p.i_w {
-                    let inp_idx =
-                        b_idx * inp_s0 + c_in_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                    inp_reshaped.push(inp[inp_idx]);
+        let inp_reshaped;
+        let inp_values;
+        let inp_layout = if inp_s0 == p.c_in * spatial_size
+            && inp_s1 == spatial_size
+            && inp_s2 == p.i_w
+            && inp_s3 == 1
+        {
+            inp_values = inp;
+            Layout::contiguous_with_offset((p.c_in, spatial_size), b_idx * inp_s0)
+        } else {
+            // Reshape input to [c_in, h*w] for this batch.
+            inp_reshaped = {
+                let mut inp_reshaped = Vec::with_capacity(p.c_in * spatial_size);
+                for c_in_idx in 0..p.c_in {
+                    for h_idx in 0..p.i_h {
+                        for w_idx in 0..p.i_w {
+                            let inp_idx = b_idx * inp_s0
+                                + c_in_idx * inp_s1
+                                + h_idx * inp_s2
+                                + w_idx * inp_s3;
+                            inp_reshaped.push(inp[inp_idx]);
+                        }
+                    }
                 }
-            }
-        }
-        let inp_layout = Layout::contiguous((p.c_in, spatial_size));
+                inp_reshaped
+            };
+            inp_values = &inp_reshaped;
+            Layout::contiguous((p.c_in, spatial_size))
+        };
 
         // Perform matmul: [c_out, c_in] @ [c_in, spatial_size] -> [c_out, spatial_size]
         let matmul = MatMul((1, p.c_out, spatial_size, p.c_in));
-        let result = matmul.f(&k_reshaped, &k_layout, &inp_reshaped, &inp_layout)?;
+        let result = matmul.f(&k_reshaped, &k_layout, inp_values, &inp_layout)?;
 
         // Copy result to output
         let out_offset = b_idx * p.c_out * spatial_size;
@@ -142,29 +194,6 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
     // Output shape: [b_size, c_out, out_h, out_w].
     let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
 
-    // Pack NCHW input as NHWC for the tiled inner loop. Do not infer this from
-    // strides: NCHW can have the same numeric strides as NHWC for shapes where
-    // channels equals width, e.g. [1, 32, 32, 32].
-    let cont_s0 = p.i_h * p.i_w * p.c_in;
-    let cont_s1 = p.i_w * p.c_in;
-    let cont_s2 = p.c_in;
-    let inp_cont: Vec<T> = {
-        let mut inp_cont = vec![T::zero(); p.b_size * p.c_in * p.i_h * p.i_w];
-        for b_idx in 0..p.b_size {
-            for h_idx in 0..p.i_h {
-                for w_idx in 0..p.i_w {
-                    for c_idx in 0..p.c_in {
-                        let src_idx =
-                            b_idx * inp_s0 + c_idx * inp_s1 + h_idx * inp_s2 + w_idx * inp_s3;
-                        let dst_idx = b_idx * cont_s0 + h_idx * cont_s1 + w_idx * cont_s2 + c_idx;
-                        inp_cont[dst_idx] = inp[src_idx]
-                    }
-                }
-            }
-        }
-        inp_cont
-    };
-
     // shape of k: [c_out, c_in, k_h, k_w]
     // strides of k: [k_s0, k_s1, k_s2, k_s3]
     // For matmul, we need flattened k in shape [c_out, k_h * k_w * c_in]
@@ -191,10 +220,12 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
     const TILE_SIZE: usize = 512;
 
     let total_out_pixels = out_h * out_w;
+    let use_same3_interior_fast_path =
+        p.k_h == 3 && p.k_w == 3 && p.stride == 1 && p.padding == 1 && p.dilation == 1;
 
     // Process batches and tiles in parallel using rayon.
     (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
-        let inp_offset = b_idx * cont_s0;
+        let inp_offset = b_idx * inp_s0;
         let out_batch_offset = b_idx * (p.c_out * out_h * out_w);
 
         let num_tiles = total_out_pixels.div_ceil(TILE_SIZE);
@@ -204,17 +235,34 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
             let tile_end = (tile_start + TILE_SIZE).min(total_out_pixels);
             let tile_size = tile_end - tile_start;
 
-            // Precompute output coordinates.
-            // Used in both im2col extraction and writing output.
-            let out_coords: Vec<_> = (tile_start..tile_end)
-                .map(|idx| (idx / out_w, idx % out_w))
-                .collect();
-
             // Build im2col tile: [k_size, tile_size]
             // This represents the input patches needed for this tile of outputs
             let mut col_tile = vec![T::zero(); k_size * tile_size];
 
-            for (tile_idx, (out_y, out_x)) in out_coords.iter().enumerate() {
+            for (tile_idx, out_idx) in (tile_start..tile_end).enumerate() {
+                let out_y = out_idx / out_w;
+                let out_x = out_idx % out_w;
+                if use_same3_interior_fast_path
+                    && out_y > 0
+                    && out_y + 1 < p.i_h
+                    && out_x > 0
+                    && out_x + 1 < p.i_w
+                {
+                    for c_in in 0..p.c_in {
+                        for kh in 0..3 {
+                            let inp_base = inp_offset
+                                + c_in * inp_s1
+                                + (out_y + kh - 1) * inp_s2
+                                + (out_x - 1) * inp_s3;
+                            for kw in 0..3 {
+                                let patch_offset = c_in + (kh * 3 + kw) * p.c_in;
+                                let col_idx = patch_offset * tile_size + tile_idx;
+                                col_tile[col_idx] = inp[inp_base + kw * inp_s3];
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Extract the im2col patch for this output position
                 for c_in in 0..p.c_in {
                     let mut patch_offset = c_in;
@@ -229,13 +277,13 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
                         for kw in 0..p.k_w {
                             let in_x =
                                 (out_x * p.stride + kw * p.dilation) as isize - p.padding as isize;
-
                             if in_x >= 0 && in_x < p.i_w as isize {
                                 let in_y = in_y as usize;
                                 let in_x = in_x as usize;
-                                let inp_idx = inp_offset + in_y * cont_s1 + in_x * cont_s2 + c_in;
+                                let inp_idx =
+                                    inp_offset + c_in * inp_s1 + in_y * inp_s2 + in_x * inp_s3;
                                 let col_idx = patch_offset * tile_size + tile_idx;
-                                col_tile[col_idx] = inp_cont[inp_idx];
+                                col_tile[col_idx] = inp[inp_idx];
                             }
                             // Move to next position (skip c_in channels)
                             patch_offset += p.c_in;
@@ -256,7 +304,9 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
             let result = matmul.f(&k_flat, &k_layout, &col_tile, &col_layout)?;
 
             // Copy results to output: result is [c_out, tile_size]
-            for (tile_idx, (out_y, out_x)) in out_coords.iter().enumerate() {
+            for (tile_idx, out_idx) in (tile_start..tile_end).enumerate() {
+                let out_y = out_idx / out_w;
+                let out_x = out_idx % out_w;
                 let dst_base = out_batch_offset + out_y * out_w + out_x;
 
                 for c_out_idx in 0..p.c_out {
@@ -598,5 +648,79 @@ mod tests {
 
         assert!(max_abs(&direct, &full) < 1e-4);
         assert!(max_abs(&tiled, &full) < 1e-4);
+    }
+
+    #[test]
+    #[ignore]
+    fn conv2d_impls_bench_stardist_shapes() {
+        let shapes = [
+            (1, 32, 512, 512),
+            (32, 32, 512, 512),
+            (32, 32, 256, 256),
+            (32, 32, 128, 128),
+            (32, 64, 128, 128),
+            (64, 64, 64, 64),
+            (64, 128, 64, 64),
+            (128, 128, 32, 32),
+            (128, 256, 32, 32),
+            (256, 128, 16, 16),
+            (384, 128, 64, 64),
+            (192, 64, 128, 128),
+            (96, 32, 256, 256),
+            (32, 128, 256, 256),
+            (1, 32, 256, 256),
+            (32, 32, 128, 128),
+            (32, 64, 64, 64),
+            (64, 128, 32, 32),
+            (128, 256, 16, 16),
+            (384, 128, 32, 32),
+            (192, 64, 64, 64),
+            (96, 32, 128, 128),
+            (32, 128, 128, 128),
+        ];
+
+        for (c_in, c_out, h, w) in shapes {
+            let params = ParamsConv2D {
+                b_size: 1,
+                i_h: h,
+                i_w: w,
+                k_h: 3,
+                k_w: 3,
+                c_out,
+                c_in,
+                padding: 1,
+                stride: 1,
+                dilation: 1,
+                cudnn_fwd_algo: None,
+            };
+            let input = (0..params.b_size * params.c_in * params.i_h * params.i_w)
+                .map(|v| (v % 17) as f32 / 8.0 - 1.0)
+                .collect::<Vec<_>>();
+            let kernel = (0..params.c_out * params.c_in * params.k_h * params.k_w)
+                .map(|v| (v % 13) as f32 / 6.0 - 1.0)
+                .collect::<Vec<_>>();
+            let input_l = Layout::contiguous((params.b_size, params.c_in, params.i_h, params.i_w));
+            let kernel_l =
+                Layout::contiguous((params.c_out, params.c_in, params.k_h, params.k_w));
+
+            let started = std::time::Instant::now();
+            let _ = conv2d_tiled(&params, &input, &input_l, &kernel, &kernel_l).unwrap();
+            let tiled = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let _ = conv2d_direct(&params, &input, &input_l, &kernel, &kernel_l).unwrap();
+            let direct = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let _ = conv2d_im2col_gemm(&params, &input, &input_l, &kernel, &kernel_l).unwrap();
+            let full = started.elapsed();
+
+            eprintln!(
+                "conv2d c_in={c_in:3} c_out={c_out:3} h={h:3} w={w:3}: tiled={:.3}s direct={:.3}s full={:.3}s",
+                tiled.as_secs_f64(),
+                direct.as_secs_f64(),
+                full.as_secs_f64()
+            );
+        }
     }
 }

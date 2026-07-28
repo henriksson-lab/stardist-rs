@@ -669,7 +669,7 @@ pub fn non_maximum_suppression_3d_inds(
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(remaining);
+            .min(remaining.div_ceil(16));
 
         let suppressed_this_round = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);

@@ -658,6 +658,12 @@ pub fn inside_tetrahedron(
 #[derive(Clone, Debug)]
 pub(crate) struct TetrahedronPlanes {
     halfspaces: [HalfspaceDet; 4],
+    z_min: f32,
+    z_max: f32,
+    y_min: f32,
+    y_max: f32,
+    x_min: f32,
+    x_max: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -732,6 +738,12 @@ pub(crate) fn precompute_tetrahedron_planes(
                 precompute_halfspace_det(r[0], r[1], r[2], c[0], c[1], c[2], b[0], b[1], b[2]),
                 precompute_halfspace_det(r[0], r[1], r[2], a[0], a[1], a[2], c[0], c[1], c[2]),
             ],
+            z_min: r[0].min(a[0]).min(b[0]).min(c[0]),
+            z_max: r[0].max(a[0]).max(b[0]).max(c[0]),
+            y_min: r[1].min(a[1]).min(b[1]).min(c[1]),
+            y_max: r[1].max(a[1]).max(b[1]).max(c[1]),
+            x_min: r[2].min(a[2]).min(b[2]).min(c[2]),
+            x_max: r[2].max(a[2]).max(b[2]).max(c[2]),
         });
     }
     tetrahedra
@@ -739,6 +751,15 @@ pub(crate) fn precompute_tetrahedron_planes(
 
 #[inline]
 fn inside_precomputed_tetrahedron(z: f32, y: f32, x: f32, tetra: &TetrahedronPlanes) -> bool {
+    if z < tetra.z_min
+        || z > tetra.z_max
+        || y < tetra.y_min
+        || y > tetra.y_max
+        || x < tetra.x_min
+        || x > tetra.x_max
+    {
+        return false;
+    }
     point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[0])
         && point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[1])
         && point_in_precomputed_halfspace(z, y, x, tetra.halfspaces[2])

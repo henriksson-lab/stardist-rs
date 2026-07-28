@@ -1,9 +1,9 @@
 /target/
 .tmp/
 Cargo.lock
+PLAN.md
+stardist/
+*.swp
 vendor/**/target/
 vendor/**/.cargo-ok
 vendor/**/.cargo_vcs_info.json
-stardist/build/
-stardist/**/*.so
-stardist/**/__pycache__/

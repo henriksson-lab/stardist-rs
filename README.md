@@ -2,6 +2,7 @@
 
 This is a Rust translation of [StarDist](https://github.com/stardist/stardist) - Object Detection with Star-convex Shapes
 
+* 2026-07-28: Speed now higher than original
 * 2026-07-27: Work on getting proper speed. 2d is ok with GPU, and 3d CUDA now has exact-label parity with postprocessing close to the original implementation.
 * 2026-07-26: Initial translation
 
@@ -138,8 +139,16 @@ Representative local 2D results on `assets/data/images/img2d.tif`:
 | Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Burn CPU | 0.592 s | 1.502 s | 2.54x slower | 0.283 s | 1.484 s | 5.25x slower | 2.147 s | 0.234 s | 9.2x faster | 1214.3 MiB | 283.3 MiB | 4.3x lower | labels exact; raw max diff `2.29e-5` |
-| Candle CPU | 0.592 s | 2.568 s | 4.34x slower | 0.283 s | 2.383 s | 8.43x slower | 2.147 s | 0.185 s | 11.6x faster | 1214.3 MiB | 286.8 MiB | 4.2x lower | labels exact; raw max diff `2.29e-5` |
+| Candle CPU | 0.592 s | 0.663 s | 1.12x slower | 0.283 s | 0.643 s | 2.27x slower | 2.147 s | 0.078 s | 27.7x faster | 1214.3 MiB | 291.5 MiB | 4.2x lower | labels exact; raw max diff `2.29e-5` |
 | Candle CUDA, Quadro RTX 5000 sm75 | 0.592 s | 0.050 s | 11.9x faster | 0.283 s | 0.111 s | 2.6x faster | 2.147 s | 0.075 s | 28.5x faster | 1214.3 MiB | 378.0 MiB | 3.2x lower | labels exact; raw max diff `4.58e-5` |
+
+For an end-to-end sparse prediction plus instance-label postprocess path:
+
+| Backend/device | Python total | Rust total | Total speed |
+| --- | ---: | ---: | ---: |
+| Burn CPU | 2.430 s | 1.718 s | 1.41x faster |
+| Candle CPU | 2.430 s | 0.721 s | 3.37x faster |
+| Candle CUDA, Quadro RTX 5000 sm75 | 2.430 s | 0.186 s | 13.1x faster |
 
 These timings include TensorFlow/Python and Burn/Flex CPU behavior on this
 machine. Treat them as translation diagnostics, not portable performance
@@ -149,7 +158,11 @@ Representative local 3D results on `assets/data/images/img3d.tif`:
 
 | Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Candle CUDA, Quadro RTX 5000 sm75 | 0.303 s | 0.096 s | 3.1x faster | 0.369 s | 0.174 s | 2.1x faster | 0.629 s | 0.857 s | 1.4x slower | 1369.7 MiB | 374.0 MiB | 3.7x lower | labels exact; raw prob max diff `7.15e-7`; raw dist max diff `1.34e-5` |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.303 s | 0.096 s | 3.2x faster | 0.369 s | 0.178 s | 2.1x faster | 0.629 s | 0.454 s | 1.4x faster | 1369.7 MiB | 373.7 MiB | 3.7x lower | labels exact; raw prob max diff `7.15e-7`; raw dist max diff `1.34e-5` |
+
+For the same end-to-end sparse prediction plus instance-label postprocess path,
+3D Candle CUDA is 1.58x faster than the original Python code (0.998 s Python
+total, 0.632 s Rust total).
 
 The 3D CUDA row uses Candle's non-cuDNN CUDA Conv3d path on CUDA 12.8. The raw
 network path has parity. The Rust NMS path skips the local brute-force
