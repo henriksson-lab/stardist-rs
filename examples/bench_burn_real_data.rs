@@ -381,6 +381,16 @@ mod bench {
     }
 
     fn max_rss_kib() -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+            if rc == 0 {
+                let usage = unsafe { usage.assume_init() };
+                return (usage.ru_maxrss as u64) / 1024;
+            }
+        }
+
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
             return 0;
         };

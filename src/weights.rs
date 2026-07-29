@@ -109,7 +109,7 @@ pub fn load_keras_hdf5_weights(path: impl AsRef<Path>) -> Result<KerasWeights, W
                     weight.name = key;
                     weights.tensors.insert(weight.name.clone(), weight);
                 }
-                hdf5::LocationType::NamedDatatype => {}
+                hdf5::LocationType::NamedDatatype | hdf5::LocationType::TypeMap => {}
             }
         }
     }

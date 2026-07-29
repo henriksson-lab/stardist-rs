@@ -35,7 +35,10 @@ def _normalize(x: np.ndarray) -> np.ndarray:
 
 
 def _rss_kib() -> int:
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if sys.platform == "darwin":
+        return rss // 1024
+    return rss
 
 
 def _bench_2d(repeats: int) -> dict[str, object]:

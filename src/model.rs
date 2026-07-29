@@ -5860,8 +5860,12 @@ pub mod candle {
                     if input_z >= depth {
                         continue;
                     }
-                    let input_slice = input.narrow(2, input_z, 1)?.squeeze(2)?;
-                    let weight_slice = self.weight.narrow(2, kernel_z, 1)?.squeeze(2)?;
+                    let input_slice = input.narrow(2, input_z, 1)?.squeeze(2)?.contiguous()?;
+                    let weight_slice = self
+                        .weight
+                        .narrow(2, kernel_z, 1)?
+                        .squeeze(2)?
+                        .contiguous()?;
                     let next =
                         Conv2d::new(weight_slice, None, conv2d_config).forward(&input_slice)?;
                     partial = Some(match partial {
