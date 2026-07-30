@@ -917,54 +917,31 @@ pub fn poly_intersection_area(poly_a_path: &[[f32; 2]], poly_b_path: &[[f32; 2]]
         return 0.0;
     }
 
-    use geo_clipper::ClipperInt;
-    use geo_types::{Coord, LineString, Polygon};
+    use geo_clipper_pure_rs::{ClipType, Clipper, IntPoint, PolyFillType, PolyType};
 
-    let mut a = Vec::with_capacity(poly_a_path.len() + 1);
-    let mut b = Vec::with_capacity(poly_b_path.len() + 1);
+    let mut clipper = Clipper::new();
+    let mut a = Vec::with_capacity(poly_a_path.len());
+    let mut b = Vec::with_capacity(poly_b_path.len());
     for p in poly_a_path {
-        a.push(Coord {
-            x: p[0] as i64,
-            y: p[1] as i64,
-        });
+        a.push(IntPoint::new(p[0] as i64, p[1] as i64));
     }
     for p in poly_b_path {
-        b.push(Coord {
-            x: p[0] as i64,
-            y: p[1] as i64,
-        });
+        b.push(IntPoint::new(p[0] as i64, p[1] as i64));
     }
-    a.push(a[0]);
-    b.push(b[0]);
 
-    let poly_a = Polygon::new(LineString(a), vec![]);
-    let poly_b = Polygon::new(LineString(b), vec![]);
-    let intersection = poly_a.intersection(&poly_b);
-    let mut area = 0.0f32;
-    for poly in intersection.0 {
-        area += area_from_path_i64(poly.exterior().0.as_slice());
-        for interior in poly.interiors() {
-            area -= area_from_path_i64(interior.0.as_slice());
-        }
-    }
-    area
-}
-
-fn area_from_path_i64(path: &[geo_types::Coord<i64>]) -> f32 {
-    if path.len() < 3 {
+    if clipper.add_path(&a, PolyType::Subject, true).is_err()
+        || clipper.add_path(&b, PolyType::Clip, true).is_err()
+    {
         return 0.0;
     }
-    let mut area = 0.0f32;
-    let n = if path[0] == path[path.len() - 1] {
-        path.len() - 1
-    } else {
-        path.len()
-    };
-    for i in 0..n {
-        area += path[i].x as f32 * path[(i + 1) % n].y as f32
-            - path[i].y as f32 * path[(i + 1) % n].x as f32;
+
+    match clipper.execute(ClipType::Intersection, PolyFillType::NonZero) {
+        Ok(paths) => paths
+            .iter()
+            .map(|path| geo_clipper_pure_rs::area(path).abs() as f32)
+            .sum(),
+        Err(_) => 0.0,
     }
-    0.5 * area.abs()
 }
 
 #[cfg(test)]
@@ -1061,6 +1038,33 @@ mod tests {
         let a = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
         let b = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
         assert!((poly_intersection_area(&a, &b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn poly_intersection_area_matches_expected_cases() {
+        let cases: &[(&[[f32; 2]], &[[f32; 2]])] = &[
+            (
+                &[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
+                &[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]],
+            ),
+            (
+                &[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
+                &[[3.0, 3.0], [5.0, 3.0], [5.0, 5.0], [3.0, 5.0]],
+            ),
+            (
+                &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+                &[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]],
+            ),
+        ];
+        let expected = [1.0, 0.0, 1.0];
+
+        for ((a, b), expected) in cases.iter().zip(expected) {
+            let area = poly_intersection_area(a, b);
+            assert!(
+                (area - expected).abs() <= 1e-3,
+                "area={area} expected={expected}"
+            );
+        }
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod big;
 pub mod bioimageio;
 pub mod config;
@@ -58,20 +60,21 @@ pub use matching::{
 pub use model::{
     _is_multiclass, _parse_classes_arg, _tf_version_at_least, AxesDivByError, AxesError,
     AxesTileOverlapError, ClassesArg, ClassesArgError, ConfigClass, LossError, MaskedPenalty,
-    OptimizeThresholdsError, PadMode, ResizerError, StarDist2D, StarDist2DInstances,
-    StarDist2DOutputs, StarDist2DPostprocessError, StarDist2DPredictInstancesResult,
-    StarDist2DScale, StarDist2DTrainSetup, StarDist3D, StarDist3DInstances,
-    StarDist3DPostprocessError, StarDist3DPredictInstancesResult, StarDist3DScale,
-    StarDist3DTrainSetup, StarDistBigPrediction, StarDistBigResult, StarDistBuildError,
-    StarDistBuildGraph, StarDistBuildLayer, StarDistCheckpointCallback, StarDistData2D,
-    StarDistData2DBatch, StarDistData3D, StarDistData3DBatch, StarDistDataBase, StarDistDataError,
-    StarDistDirectPrediction, StarDistModelLoadError, StarDistPadAndCropResizer,
+    OptimizeThresholdsError, PadMode, PreferredInferenceBackend, ResizerError, StarDist2D,
+    StarDist2DInstances, StarDist2DOutputs, StarDist2DPostprocessError,
+    StarDist2DPredictInstancesResult, StarDist2DScale, StarDist2DTrainSetup, StarDist3D,
+    StarDist3DInstances, StarDist3DPostprocessError, StarDist3DPredictInstancesResult,
+    StarDist3DScale, StarDist3DTrainSetup, StarDistBigPrediction, StarDistBigResult,
+    StarDistBuildError, StarDistBuildGraph, StarDistBuildLayer, StarDistCheckpointCallback,
+    StarDistData2D, StarDistData2DBatch, StarDistData3D, StarDistData3DBatch, StarDistDataBase,
+    StarDistDataError, StarDistDirectPrediction, StarDistModelLoadError, StarDistPadAndCropResizer,
     StarDistPredictError, StarDistPredictInstancesBigError, StarDistPredictSetup,
     StarDistPrediction, StarDistPreparedTraining, StarDistSparsePrediction, StarDistThresholds,
     StarDistTrainCallback, StarDistTrainDistLoss, StarDistTrainError,
     StarDistTrainingFinishedAction, ThresholdsError, ThresholdsLoadError, generic_masked_loss, kld,
     masked_loss, masked_loss_iou, masked_loss_mae, masked_loss_mse, masked_metric_iou,
-    masked_metric_mae, masked_metric_mse, weighted_categorical_crossentropy,
+    masked_metric_mae, masked_metric_mse, preferred_inference_backend,
+    weighted_categorical_crossentropy,
 };
 pub use nms::{
     _ind_prob_thresh, _non_maximum_suppression_old, NonMaximumSuppression2D,

@@ -5710,6 +5710,40 @@ impl StarDist3D {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreferredInferenceBackend {
+    #[cfg(feature = "candle-cuda")]
+    CandleCuda,
+    #[cfg(feature = "candle-metal")]
+    CandleMetal,
+    #[cfg(feature = "burn")]
+    BurnCpu,
+}
+
+pub fn preferred_inference_backend() -> Option<PreferredInferenceBackend> {
+    #[cfg(feature = "candle-cuda")]
+    {
+        if ::candle_core::Device::new_cuda(0).is_ok() {
+            return Some(PreferredInferenceBackend::CandleCuda);
+        }
+    }
+
+    #[cfg(feature = "candle-metal")]
+    {
+        if ::candle_core::Device::new_metal(0).is_ok() {
+            return Some(PreferredInferenceBackend::CandleMetal);
+        }
+    }
+
+    #[cfg(feature = "burn")]
+    {
+        return Some(PreferredInferenceBackend::BurnCpu);
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 #[cfg(feature = "candle")]
 pub mod candle {
     use ::candle_core::{DType, Device, Error as CandleError, Result as CandleResult, Tensor};
@@ -5824,8 +5858,8 @@ pub mod candle {
                     self.weight.clone(),
                     self.bias.clone(),
                     Conv3dConfig {
-                        padding: self.config.padding[0],
-                        stride: self.config.stride[0],
+                        padding: self.config.padding,
+                        stride: self.config.stride,
                         ..Default::default()
                     },
                 )

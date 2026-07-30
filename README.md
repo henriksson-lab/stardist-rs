@@ -2,12 +2,14 @@
 
 This is a Rust translation of [StarDist](https://github.com/stardist/stardist) - Object Detection with Star-convex Shapes
 
+* 2026-07-30: Replaced clipper with faster pure rust version
 * 2026-07-28: Speed now higher than original
 * 2026-07-27: Work on getting proper speed. 2d is ok with GPU, and 3d CUDA now has exact-label parity with postprocessing close to the original implementation.
 * 2026-07-26: Initial translation
 
 Translated from upstream StarDist commit `e80c6de700693bc228ed3c9ba1dc19c3785667ee`.
 
+Note that this crate has non-Rust dependencies. The aim is to minimize them but it will take some time to get them to zero.
 
 ## Below is a blurb that we should add to all our crates; it is the latest version
 ## ⚠ This is an LLM-mediated faithful (hopefully) translation, not the original code!
@@ -74,20 +76,43 @@ information about how we approach translation.
 
 CLI-style prediction adapters are kept behind the optional `cli` feature.
 
-Enable the `burn` or `candle` feature for native model implementations. The default feature set includes `hdf5`, which is needed for loading Keras `.h5` weights.
+By default, `stardist-rs` enables Burn CPU inference and pure-Rust HDF5 weight loading. This is the recommended default when CPU inference is required. For GPU inference, enable the Candle GPU feature for your platform instead, such as `candle-cuda` or `candle-metal`.
 
 ```toml
 [dependencies]
-stardist-rs = { version = "0.1", features = ["burn", "hdf5"] }
+stardist-rs = "0.1"
 burn = { version = "0.21", default-features = false, features = ["std", "train", "autodiff", "flex"] }
 ```
 
-For Candle 2D inference instead:
+For Candle GPU inference instead:
 
 ```toml
 [dependencies]
-stardist-rs = { version = "0.1", features = ["candle", "hdf5"] }
-candle-core = "0.9"
+stardist-rs = { version = "0.1", default-features = false, features = ["candle-cuda", "hdf5"] }
+candle-core = "0.11"
+```
+
+To prefer Candle GPU when it is compiled in and available at runtime, while
+falling back to Burn CPU otherwise, compile both backends and use
+`preferred_inference_backend()`:
+
+```toml
+[dependencies]
+stardist-rs = { version = "0.1", features = ["candle-cuda"] }
+```
+
+```rust
+match stardist_rs::preferred_inference_backend() {
+    Some(stardist_rs::PreferredInferenceBackend::CandleCuda) => {
+        // Use the Candle CUDA model path.
+    }
+    Some(stardist_rs::PreferredInferenceBackend::BurnCpu) => {
+        // Use the Burn CPU model path.
+    }
+    _ => {
+        // No compiled backend is available for this runtime.
+    }
+}
 ```
 
 Runnable examples are available under `examples/`:
@@ -115,7 +140,7 @@ To run and collect the 2D benchmark set in one JSON summary:
 ```bash
 python3 scripts/bench_real_data.py --dimensions 2d --out .tmp/bench_real_data_summary.json
 python3 scripts/bench_real_data.py --dimensions 2d --candle-cuda
-python3 scripts/bench_real_data.py --dimensions 2d --candle-cuda --cuda-home /usr/local/cuda-12.8 --cuda-compute-cap 75
+CUDA_COMPUTE_CAP=75 python3 scripts/bench_real_data.py --dimensions 2d --candle-cuda --cuda-home /usr/local/cuda-12.8 --cuda-compute-cap 75
 ```
 
 The Python script uses the untracked upstream checkout under `stardist/` and
@@ -129,26 +154,26 @@ TensorFlow GPU. The
 `--features candle-cuda,hdf5` only when the CUDA toolkit is available. Pass
 `--cuda-home` to select a specific toolkit instead of the first `nvcc` on
 `PATH`; pass `--cuda-compute-cap` if the benchmark environment cannot query the
-driver directly. This checkout patches `candle-kernels` locally to skip unused
-MoE WMMA CUDA kernels; StarDist uses F32 inference and does not need those BF16
-MoE kernels. That lets the Candle CUDA benchmark run on the local Quadro RTX
-5000 sm75/Turing GPU.
+driver directly. This checkout patches Candle through the
+`mahogny/candle` `stardist-integration` branch, which includes the Conv3d and
+CUDA sm75/Turing fixes needed for the local Quadro RTX 5000 benchmark.
 
-Representative local 2D results on `assets/data/images/img2d.tif`:
+Representative local 2D results on `assets/data/images/img2d.tif`
+after switching 2D polygon clipping to `geo-clipper-pure-rs`:
 
 | Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Burn CPU | 0.592 s | 1.502 s | 2.54x slower | 0.283 s | 1.484 s | 5.25x slower | 2.147 s | 0.234 s | 9.2x faster | 1214.3 MiB | 283.3 MiB | 4.3x lower | labels exact; raw max diff `2.29e-5` |
-| Candle CPU | 0.592 s | 0.663 s | 1.12x slower | 0.283 s | 0.643 s | 2.27x slower | 2.147 s | 0.078 s | 27.7x faster | 1214.3 MiB | 291.5 MiB | 4.2x lower | labels exact; raw max diff `2.29e-5` |
-| Candle CUDA, Quadro RTX 5000 sm75 | 0.592 s | 0.050 s | 11.9x faster | 0.283 s | 0.111 s | 2.6x faster | 2.147 s | 0.075 s | 28.5x faster | 1214.3 MiB | 378.0 MiB | 3.2x lower | labels exact; raw max diff `4.58e-5` |
+| Burn CPU | 0.288 s | 0.460 s | 1.60x slower | 0.182 s | 0.487 s | 2.67x slower | 0.295 s | 0.048 s | 6.1x faster | 1202.2 MiB | 262.6 MiB | 4.6x lower | labels exact; raw max diff `2.289e-5` |
+| Candle CPU | 0.288 s | 0.695 s | 2.42x slower | 0.182 s | 0.662 s | 3.64x slower | 0.295 s | 0.049 s | 6.1x faster | 1202.2 MiB | 281.3 MiB | 4.3x lower | labels exact; raw max diff `2.289e-5` |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.288 s | 0.049 s | 5.9x faster | 0.182 s | 0.098 s | 1.9x faster | 0.295 s | 0.047 s | 6.3x faster | 1202.2 MiB | 361.1 MiB | 3.3x lower | labels exact; raw max diff `4.578e-5` |
 
 For an end-to-end sparse prediction plus instance-label postprocess path:
 
 | Backend/device | Python total | Rust total | Total speed |
 | --- | ---: | ---: | ---: |
-| Burn CPU | 2.430 s | 1.718 s | 1.41x faster |
-| Candle CPU | 2.430 s | 0.721 s | 3.37x faster |
-| Candle CUDA, Quadro RTX 5000 sm75 | 2.430 s | 0.186 s | 13.1x faster |
+| Burn CPU | 0.477 s | 0.535 s | 1.12x slower |
+| Candle CPU | 0.477 s | 0.710 s | 1.49x slower |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.477 s | 0.145 s | 3.3x faster |
 
 These timings include TensorFlow/Python and Burn/Flex CPU behavior on this
 machine. Treat them as translation diagnostics, not portable performance
@@ -158,11 +183,11 @@ Representative local 3D results on `assets/data/images/img3d.tif`:
 
 | Backend/device | Python raw inference | Rust raw inference | Raw speed | Python sparse predict | Rust sparse predict | Sparse speed | Python postprocess | Rust postprocess | Post speed | Python peak RSS | Rust peak RSS | RSS | Parity |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Candle CUDA, Quadro RTX 5000 sm75 | 0.303 s | 0.096 s | 3.2x faster | 0.369 s | 0.178 s | 2.1x faster | 0.629 s | 0.454 s | 1.4x faster | 1369.7 MiB | 373.7 MiB | 3.7x lower | labels exact; raw prob max diff `7.15e-7`; raw dist max diff `1.34e-5` |
+| Candle CUDA, Quadro RTX 5000 sm75 | 0.363 s | 0.110 s | 3.3x faster | 0.434 s | 0.202 s | 2.1x faster | 0.913 s | 0.529 s | 1.7x faster | 1282.9 MiB | 375.1 MiB | 3.4x lower | labels exact; raw prob max diff `7.15e-7`; raw dist max diff `1.34e-5` |
 
 For the same end-to-end sparse prediction plus instance-label postprocess path,
-3D Candle CUDA is 1.58x faster than the original Python code (0.998 s Python
-total, 0.632 s Rust total).
+3D Candle CUDA is 1.84x faster than the original Python code (1.347 s Python
+total, 0.731 s Rust total).
 
 The 3D CUDA row uses Candle's non-cuDNN CUDA Conv3d path on CUDA 12.8. The raw
 network path has parity. The Rust NMS path skips the local brute-force

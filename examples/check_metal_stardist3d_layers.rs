@@ -8,12 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stardist = StarDist3D::from_model_dir("assets/models/examples/3D_demo")?;
     let config = stardist.config.clone();
     let weights = load_keras_hdf5_weights("stardist/models/examples/3D_demo/weights_best.h5")?;
-    let model_cpu =
-        stardist_rs::model::candle::StarDist3D::init(config.clone(), &cpu)
-            .load_keras_weights(&weights, &cpu)?;
-    let model_metal =
-        stardist_rs::model::candle::StarDist3D::init(config, &metal)
-            .load_keras_weights(&weights, &metal)?;
+    let model_cpu = stardist_rs::model::candle::StarDist3D::init(config.clone(), &cpu)
+        .load_keras_weights(&weights, &cpu)?;
+    let model_metal = stardist_rs::model::candle::StarDist3D::init(config, &metal)
+        .load_keras_weights(&weights, &metal)?;
 
     let input_len = 8 * 16 * 16;
     let input = (0..input_len)

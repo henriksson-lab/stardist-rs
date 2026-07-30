@@ -10,20 +10,8 @@ fn main() -> candle_core::Result<()> {
     check(&cpu, &metal, (1, 1, 8, 16, 16), (32, 1, 7, 7, 7), 3, 1)?;
     check_conv2d(&cpu, &metal, (1, 32, 17, 17), (64, 32, 3, 3), 0, 2)?;
     check_sliced_conv2d_sum(&cpu, &metal, (1, 32, 10, 17, 17), (64, 32, 3, 3, 3), 2)?;
-    check_same_for_stride(
-        &cpu,
-        &metal,
-        (1, 2, 5, 7, 9),
-        (3, 2, 3, 3, 3),
-        [1, 2, 2],
-    )?;
-    check_same_for_stride(
-        &cpu,
-        &metal,
-        (1, 4, 6, 13, 15),
-        (8, 4, 3, 3, 3),
-        [1, 2, 2],
-    )?;
+    check_same_for_stride(&cpu, &metal, (1, 2, 5, 7, 9), (3, 2, 3, 3, 3), [1, 2, 2])?;
+    check_same_for_stride(&cpu, &metal, (1, 4, 6, 13, 15), (8, 4, 3, 3, 3), [1, 2, 2])?;
     Ok(())
 }
 
@@ -100,7 +88,8 @@ fn check_sliced_conv2d_sum(
     let input_metal = Tensor::from_vec(input, input_shape, metal)?;
     let kernel_metal = Tensor::from_vec(kernel, kernel_shape, metal)?;
     let out_cpu = sliced_conv2d_sum(&input_cpu, &kernel_cpu, stride, false)?;
-    let out_metal = sliced_conv2d_sum(&input_metal, &kernel_metal, stride, false)?.to_device(cpu)?;
+    let out_metal =
+        sliced_conv2d_sum(&input_metal, &kernel_metal, stride, false)?.to_device(cpu)?;
     compare(
         "sliced_conv2d_sum",
         input_shape,
@@ -176,7 +165,13 @@ fn check_conv2d(
         .to_device(cpu)?;
     compare(
         "conv2d",
-        (input_shape.0, input_shape.1, 1, input_shape.2, input_shape.3),
+        (
+            input_shape.0,
+            input_shape.1,
+            1,
+            input_shape.2,
+            input_shape.3,
+        ),
         out_cpu.flatten_all()?.to_vec1::<f32>()?,
         out_metal.flatten_all()?.to_vec1::<f32>()?,
         out_cpu.shape(),
@@ -208,13 +203,24 @@ fn check_same_for_stride(
     let input_metal = Tensor::from_vec(input, input_shape, metal)?;
     let kernel_metal = Tensor::from_vec(kernel, kernel_shape, metal)?;
 
-    let padded_cpu = same_for_stride(&input_cpu, stride, [kernel_shape.2, kernel_shape.3, kernel_shape.4])?;
-    let padded_metal = same_for_stride(&input_metal, stride, [kernel_shape.2, kernel_shape.3, kernel_shape.4])?;
+    let padded_cpu = same_for_stride(
+        &input_cpu,
+        stride,
+        [kernel_shape.2, kernel_shape.3, kernel_shape.4],
+    )?;
+    let padded_metal = same_for_stride(
+        &input_metal,
+        stride,
+        [kernel_shape.2, kernel_shape.3, kernel_shape.4],
+    )?;
     compare(
         "same_for_stride_pad",
         input_shape,
         padded_cpu.flatten_all()?.to_vec1::<f32>()?,
-        padded_metal.to_device(cpu)?.flatten_all()?.to_vec1::<f32>()?,
+        padded_metal
+            .to_device(cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
         padded_cpu.shape(),
     );
 

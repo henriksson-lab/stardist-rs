@@ -71,49 +71,42 @@ pub fn keras_conv3d_kernel_to_burn(shape: [usize; 5], values: &[f32]) -> KerasWe
 pub fn load_keras_hdf5_weights(path: impl AsRef<Path>) -> Result<KerasWeights, WeightError> {
     let file = hdf5::File::open(path)?;
     let mut weights = KerasWeights::default();
-    let mut groups = vec![String::from("/")];
-    while let Some(group_name) = groups.pop() {
-        let group = file.group(&group_name)?;
-        for member_name in group.member_names()? {
-            let full_name = if group_name == "/" {
-                format!("/{member_name}")
-            } else {
-                format!("{group_name}/{member_name}")
-            };
-            match file.loc_type_by_name(&full_name)? {
-                hdf5::LocationType::Group => groups.push(full_name),
-                hdf5::LocationType::Dataset => {
-                    let dataset = file.dataset(&full_name)?;
-                    let shape = dataset.shape();
-                    let values = dataset.read_raw::<f32>()?;
-                    let key = full_name.trim_start_matches('/').to_string();
-                    let mut weight = match shape.as_slice() {
-                        [kh, kw, channels_in, channels_out] if key.ends_with("kernel:0") => {
-                            keras_conv2d_kernel_to_burn(
-                                [*kh, *kw, *channels_in, *channels_out],
-                                &values,
-                            )
-                        }
-                        [kd, kh, kw, channels_in, channels_out] if key.ends_with("kernel:0") => {
-                            keras_conv3d_kernel_to_burn(
-                                [*kd, *kh, *kw, *channels_in, *channels_out],
-                                &values,
-                            )
-                        }
-                        _ => KerasWeight {
-                            name: String::new(),
-                            shape,
-                            values,
-                        },
-                    };
-                    weight.name = key;
-                    weights.tensors.insert(weight.name.clone(), weight);
+    let mut groups = vec![file.root_group()?];
+    while let Some(group) = groups.pop() {
+        groups.extend(group.groups()?);
+        for dataset in group.datasets()? {
+            let shape = hdf5_shape_to_usize(dataset.shape()?)?;
+            let values = dataset.read::<f32>()?;
+            let key = dataset.name().trim_start_matches('/').to_string();
+            let mut weight = match shape.as_slice() {
+                [kh, kw, channels_in, channels_out] if key.ends_with("kernel:0") => {
+                    keras_conv2d_kernel_to_burn([*kh, *kw, *channels_in, *channels_out], &values)
                 }
-                hdf5::LocationType::NamedDatatype | hdf5::LocationType::TypeMap => {}
-            }
+                [kd, kh, kw, channels_in, channels_out] if key.ends_with("kernel:0") => {
+                    keras_conv3d_kernel_to_burn(
+                        [*kd, *kh, *kw, *channels_in, *channels_out],
+                        &values,
+                    )
+                }
+                _ => KerasWeight {
+                    name: String::new(),
+                    shape,
+                    values,
+                },
+            };
+            weight.name = key;
+            weights.tensors.insert(weight.name.clone(), weight);
         }
     }
     Ok(weights)
+}
+
+#[cfg(feature = "hdf5")]
+fn hdf5_shape_to_usize(shape: Vec<u64>) -> Result<Vec<usize>, WeightError> {
+    shape
+        .into_iter()
+        .map(|dim| usize::try_from(dim).map_err(|_| WeightError::ShapeTooLarge(dim)))
+        .collect()
 }
 
 #[cfg(not(feature = "hdf5"))]
@@ -126,6 +119,9 @@ pub enum WeightError {
     #[cfg(feature = "hdf5")]
     #[error("failed to read HDF5 weights")]
     Hdf5(#[from] hdf5::Error),
+    #[cfg(feature = "hdf5")]
+    #[error("HDF5 dataset dimension {0} does not fit in usize")]
+    ShapeTooLarge(u64),
     #[error("HDF5 support is disabled")]
     Hdf5FeatureDisabled,
 }
