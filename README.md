@@ -2,6 +2,7 @@
 
 This is a Rust translation of [StarDist](https://github.com/stardist/stardist) - Object Detection with Star-convex Shapes
 
+* 2026-08-01: CI added
 * 2026-07-30: Replaced clipper with faster pure rust version
 * 2026-07-28: Speed now higher than original
 * 2026-07-27: Work on getting proper speed. 2d is ok with GPU, and 3d CUDA now has exact-label parity with postprocessing close to the original implementation.

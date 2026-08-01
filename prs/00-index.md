@@ -32,7 +32,12 @@ Notes:
 
 - PR 3 is stacked on PR 2.
 - PR 5, PR 6, and PR 7 are stacked on PR 4.
-- PR 9, PR 10, and PR 11 are stacked on PR 8.
+- PR 8, PR 9, PR 10, and PR 11 are independent of each other and all open
+  against `main`. They were originally stacked on PR 8, but none of PR 9-11
+  touch `candle-kernels/src/compatibility.cuh`; that base only made them
+  buildable on local sm75 hardware. Each is now rebased directly onto `main`,
+  with local retest branches `validation/<branch>-sm75` (PR 8 + the one commit)
+  that are not submitted.
 - PR 12 is independent of the CUDA performance stack and can be opened against
   `main`.
 - PR 13 is stacked on PR 12. It should exclude temporary

@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-cpu:
+    name: CPU check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - macos-15-intel
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check default features
+        run: cargo check --all-targets
+
+      - name: Check minimal features
+        run: cargo check --all-targets --no-default-features
+
+      - name: Check Candle CPU features
+        run: cargo check --all-targets --no-default-features --features candle,hdf5
+
+      - name: Check Burn CPU features
+        run: cargo check --all-targets --no-default-features --features burn,hdf5
+
+  check-metal:
+    name: Metal check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Metal features
+        run: cargo check --all-targets --no-default-features --features candle-metal,hdf5
+
+  check-cuda:
+    name: CUDA/cuDNN check
+    runs-on: ubuntu-22.04
+    env:
+      CUDA_COMPUTE_CAP: "75"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          method: network
+
+      - name: Install cuDNN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g cudnn9-cuda-12
+
+      - name: Check CUDA features
+        run: cargo check --all-targets --no-default-features --features candle-cuda,hdf5
+        env:
+          CUDA_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:/usr/local/cuda/lib64
+
+      - name: Check cuDNN features
+        run: cargo check --all-targets --no-default-features --features candle-cudnn,hdf5
+        env:
+          CUDA_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+          LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:/usr/local/cuda/lib64

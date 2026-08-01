@@ -1,8 +1,8 @@
 # PR 9: CUDA GEMM Broadcast Batch Collapse
 
 Branch: `cuda-f32-gemm-broadcast-collapse`
-Base: `cuda-sm75-compat`
-Head commit: `8b5605fc`
+Base: `main`
+Head commit: `2b8b3ace`
 
 Suggested title:
 
@@ -17,13 +17,15 @@ cd /home/mahogny/github/claude/candle
 git checkout cuda-f32-gemm-broadcast-collapse
 git push -u origin cuda-f32-gemm-broadcast-collapse
 gh pr create \
-  --base cuda-sm75-compat \
+  --base main \
   --head <your-github-user>:cuda-f32-gemm-broadcast-collapse \
   --title "Optimize CUDA broadcast matmul collapse" \
   --body-file /data/henriksson/github/claude/stardist-rs/prs/09-cuda-gemm-broadcast-collapse.md
 ```
 
-If PR 8 is merged first, rebase this branch onto upstream `main` and open it against `main`.
+This branch is independent of PR 8 and can be opened in any order relative to
+it. Local sm75 builds need PR 8, so retest on `validation/cuda-f32-gemm-broadcast-collapse-sm75`,
+which is PR 8 plus this commit and is not submitted.
 
 Suggested PR body:
 
@@ -46,7 +48,11 @@ Broadcasted RHS matmul appears in model and image-processing workloads where the
 
 ## Validation
 
-Validated locally with:
+Validated locally on Quadro RTX 5000 / sm75 / CUDA 12.8. The CUDA commands below
+were run on `validation/cuda-f32-gemm-broadcast-collapse-sm75`, which is this
+commit plus the separate sm75 build-compatibility fix (PR 8); that fix only
+affects whether `candle-kernels` compiles on Turing locally and is not part of
+this PR.
 
 ```bash
 cargo fmt
@@ -65,7 +71,7 @@ CUDA_COMPUTE_CAP=75 \
 LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib:$LD_LIBRARY_PATH \
 cargo check -p candle-core --features cuda
 
-git diff --check cuda-sm75-compat..cuda-f32-gemm-broadcast-collapse
+git diff --check main..cuda-f32-gemm-broadcast-collapse
 ```
 
 ## Benchmark
@@ -74,7 +80,7 @@ Shape: `[64, 256, 256] @ [256, 256]`
 
 | Branch | Time |
 | --- | ---: |
-| `cuda-sm75-compat` | 3.648 ms |
+| Baseline | 3.648 ms |
 | This PR | 2.946 ms |
 
 Ratio: 1.24x faster.
@@ -83,3 +89,4 @@ Ratio: 1.24x faster.
 
 - The helper is intentionally general across floating point element types.
 - The optimization is gated by layout checks; non-matching layouts continue through the existing path.
+- The diff touches only `candle-core/src/cuda_backend/mod.rs` and is independent of my other CUDA PRs.

@@ -1,8 +1,8 @@
 # PR 10: CUDA F32 Softmax Last-Dim 1024 Fast Path
 
 Branch: `cuda-softmax-1024-f32`
-Base: `cuda-sm75-compat`
-Head commit: `ccae8ef6`
+Base: `main`
+Head commit: `e5b52b76`
 
 Suggested title:
 
@@ -17,13 +17,15 @@ cd /home/mahogny/github/claude/candle
 git checkout cuda-softmax-1024-f32
 git push -u origin cuda-softmax-1024-f32
 gh pr create \
-  --base cuda-sm75-compat \
+  --base main \
   --head <your-github-user>:cuda-softmax-1024-f32 \
   --title "Add CUDA f32 softmax 1024 fast path" \
   --body-file /data/henriksson/github/claude/stardist-rs/prs/10-cuda-softmax-1024-f32.md
 ```
 
-If PR 8 is merged first, rebase this branch onto upstream `main` and open it against `main`.
+This branch is independent of PR 8 and can be opened in any order relative to
+it. Local sm75 builds need PR 8, so retest on `validation/cuda-softmax-1024-f32-sm75`,
+which is PR 8 plus this commit and is not submitted.
 
 Suggested PR body:
 
@@ -45,7 +47,10 @@ Softmax with a 1024-wide last dimension is common enough to benefit from a speci
 
 ## Validation
 
-Validated locally with:
+Validated locally on Quadro RTX 5000 / sm75 / CUDA 12.8. The CUDA commands below
+were run on `validation/cuda-softmax-1024-f32-sm75`, which is this commit plus the
+separate sm75 build-compatibility fix (PR 8); that fix only affects whether
+`candle-kernels` compiles on Turing locally and is not part of this PR.
 
 ```bash
 cargo fmt
@@ -64,7 +69,7 @@ CUDA_COMPUTE_CAP=75 \
 LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib:$LD_LIBRARY_PATH \
 cargo check -p candle-core --features cuda
 
-git diff --check cuda-sm75-compat..cuda-softmax-1024-f32
+git diff --check main..cuda-softmax-1024-f32
 ```
 
 ## Benchmark
@@ -73,7 +78,7 @@ Shape: `[8192, 1024]`
 
 | Branch | Time |
 | --- | ---: |
-| `cuda-sm75-compat` | 6.194 ms |
+| Baseline | 6.194 ms |
 | This PR | 4.789 ms |
 
 Ratio: 1.29x faster.
@@ -81,3 +86,4 @@ Ratio: 1.29x faster.
 ## Review Notes
 
 This is intentionally a narrow specialization. It should be easy to review and can be generalized later if Candle wants broader softmax tiling coverage.
+- The diff touches only `candle-kernels/src/reduce.cu` and `candle-nn/src/ops.rs` and is independent of my other CUDA PRs.
